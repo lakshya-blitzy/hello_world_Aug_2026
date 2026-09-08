@@ -109,8 +109,11 @@ const routes = require('./routes');
  *
  * @param {unknown} extraRouters The caller-supplied value to check.
  * @returns {void} Returns nothing; the value is unchanged on success.
- * @throws {TypeError} When `extraRouters` is not an array, or when any entry
- *                     is not a mountable function.
+ * @throws {TypeError} When `extraRouters` is not an array, or when any slot
+ *                     from `0` through `length - 1` does not hold a mountable
+ *                     function. A MISSING slot -- a sparse-array hole, as in
+ *                     `new Array(3)` or `[, router]` -- is rejected exactly
+ *                     like an explicit `undefined`, and is named by its index.
  */
 function assertMountableRouters(extraRouters) {
   if (!Array.isArray(extraRouters)) {
@@ -123,7 +126,18 @@ function assertMountableRouters(extraRouters) {
 
   // An index-bearing message: with several injected routers, "entry 2" is the
   // difference between a one-line fix and bisecting the harness.
-  extraRouters.forEach((router, index) => {
+  //
+  // WHY A COUNTING LOOP AND NOT `forEach`. `forEach` skips the holes in a
+  // sparse array, so it would pass an array such as `new Array(3)` or
+  // `[, router]` as valid -- and the registration loop below, which iterates,
+  // yields `undefined` for those same holes and fails inside `app.use()` after
+  // the pipeline is already assembled, with neither the index nor the option
+  // name in the message. Visiting every slot from `0` to `length - 1` reads a
+  // hole as the `undefined` it will register as, which is what makes the
+  // fail-early contract above true. Do not "modernise" this back to `forEach`.
+  for (let index = 0; index < extraRouters.length; index += 1) {
+    const router = extraRouters[index];
+
     if (typeof router !== 'function') {
       throw new TypeError(
         `createApp: options.extraRouters[${index}] must be an ` +
@@ -131,7 +145,49 @@ function assertMountableRouters(extraRouters) {
           (router === null ? 'null' : typeof router)
       );
     }
-  });
+  }
+}
+
+/**
+ * `express.json()` verify hook: records how many bytes of payload the parser
+ * actually consumed, as `req.jsonPayloadLength`.
+ *
+ * WHY THE PARSER IS THE ONLY PLACE THIS CAN BE MEASURED. `express.json()`
+ * special-cases an empty payload and yields `{}` for it rather than raising a
+ * parse error, so once parsing is done a request that carried no bytes and a
+ * request that carried the two bytes `{}` are represented by equal values.
+ * Nothing downstream can separate them: the request stream is consumed, and
+ * the framing headers answer only for a request that declared
+ * `Content-Length` -- a `Transfer-Encoding: chunked` message declares no
+ * length, so a zero-byte chunked payload is invisible in the headers. The
+ * verify callback runs after the full payload has been read and before it is
+ * parsed, which is the one point where the true byte count exists.
+ *
+ * It only records; it never rejects. A throw from a verify callback is turned
+ * by body-parser into a 403 `entity.verify.failed`, a status this service's
+ * contract does not include, so validation belongs in the route that has the
+ * context to decide -- and does not run at all for a request the parser
+ * itself rejects as too large, malformed or unsupported.
+ *
+ * CONSISTENCY OBLIGATION -- two files, one contract.
+ * `src/routes/api.routes.js` reads `req.jsonPayloadLength` to tell an empty
+ * payload from an empty JSON document, and treats its absence as "the parser
+ * never ran, so nothing was consumed". Removing this hook, renaming the
+ * property or dropping it from position 4 therefore turns every JSON-bodied
+ * request to `POST /api/v1/echo` into a `400 Request body is required` -- a
+ * loud, immediate failure rather than a silent hole in the contract, which is
+ * the deliberate choice. Change the two together.
+ *
+ * @param {import('express').Request} req The request being parsed; receives
+ *   the `jsonPayloadLength` property.
+ * @param {import('express').Response} res The response, unused. Present
+ *   because body-parser's verify signature supplies it.
+ * @param {Buffer} buf The raw payload as read, after any `Content-Encoding`
+ *   inflation and before parsing. Its `length` is the byte count recorded.
+ * @returns {void} Nothing; the payload is neither inspected nor altered.
+ */
+function recordJsonPayloadLength(req, res, buf) {
+  req.jsonPayloadLength = buf.length;
 }
 
 /**
@@ -240,7 +296,12 @@ function createApp({ extraRouters = [] } = {}) {
   // passed through as the string it is. An over-limit body becomes an
   // `entity.too.large` error that position 8 renders as 413; a malformed one
   // becomes `entity.parse.failed`, rendered 400.
-  app.use(express.json({ limit: config.bodyLimit }));
+  //
+  // `verify` records the consumed payload length -- see
+  // recordJsonPayloadLength above for why a route cannot recover it afterwards.
+  app.use(
+    express.json({ limit: config.bodyLimit, verify: recordJsonPayloadLength })
+  );
 
   // POSITION 5 -- form body parsing, bounded by the same limit.
   //

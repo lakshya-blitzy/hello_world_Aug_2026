@@ -203,12 +203,29 @@ module.exports = {
       kill_timeout: 12000,
 
       /*
-       * A ceiling on a leaking worker. PM2 restarts a worker whose resident
-       * memory exceeds this, which converts an unbounded leak into a bounded
-       * and visible restart rather than an out-of-memory kill that takes the
-       * host's other processes with it. Sized far above the service's idle
-       * footprint so that ordinary traffic never trips it, and low enough that
-       * a genuine leak is caught while the host still has room.
+       * A POLLED RESTART THRESHOLD FOR A LEAKING WORKER -- NOT A HARD CEILING,
+       * and the distinction is the reason this comment exists. PM2 samples
+       * each worker's resident memory on its own worker interval, roughly
+       * every 30 seconds (`PM2_WORKER_INTERVAL`, default 30000 ms), and
+       * restarts the worker at the first sample above this figure.
+       *
+       * What that buys: a slow leak is caught within about one sampling
+       * interval of crossing 256 MB, and the replacement shows up as a
+       * restart in `pm2 status` -- so the leak becomes a RECORDED event
+       * instead of a process quietly growing until the host suffers.
+       *
+       * What it does not buy: an enforced upper bound on resident memory. A
+       * worker allocating faster than the sampling interval can climb well
+       * past this figure between checks, and on a memory-tight host the
+       * kernel's OOM killer can reach it before PM2's next sample does -- in
+       * which case the worker dies with no drain lines and `autorestart`
+       * below replaces it. A limit that CANNOT be overshot has to come from
+       * outside PM2: a cgroup or systemd `MemoryMax=`, or a container memory
+       * limit, alongside this field rather than instead of it.
+       *
+       * The figure itself sits far above the service's idle footprint so
+       * ordinary traffic never trips it, and low enough that a genuine leak is
+       * caught while the host still has room.
        */
       max_memory_restart: '256M',
 

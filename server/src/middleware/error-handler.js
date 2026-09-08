@@ -104,7 +104,11 @@ const INTERNAL_SERVER_ERROR_MESSAGE = 'Internal Server Error';
 
 /**
  * Lowest status treated as a server fault, and therefore the threshold for
- * both production masking and the exception record.
+ * production masking.
+ *
+ * It is NOT the threshold for the exception record. That record is gated on
+ * whether the failure was unexpected, which the status cannot express -- see
+ * `resolveFailure` and the record itself.
  *
  * @type {number}
  */
@@ -117,6 +121,31 @@ const SERVER_ERROR_MIN_STATUS = 500;
  * @type {number}
  */
 const FALLBACK_STATUS = 500;
+
+/**
+ * The range of statuses this handler is willing to send for a failure: the
+ * client-error and server-error classes, inclusive.
+ *
+ * The bounds match `HttpError`'s own constructor validation, and restating
+ * them here rather than importing them is deliberate on two counts. This
+ * file's imports are fixed at three by its contract, and `lib/http-error.js`
+ * exports the bare class so there is nothing else to import from it. More to
+ * the point, the two checks answer different questions: the constructor's
+ * decides whether such an error may be created, while this one decides whether
+ * a status may be handed to `res.status()` -- which it must, because `status`
+ * is a mutable public field that can be reassigned long after construction.
+ * The pair is a consistency obligation: moving one bound means moving both.
+ *
+ * @type {number}
+ */
+const MIN_SENDABLE_ERROR_STATUS = 400;
+
+/**
+ * Upper bound of the sendable failure range. See `MIN_SENDABLE_ERROR_STATUS`.
+ *
+ * @type {number}
+ */
+const MAX_SENDABLE_ERROR_STATUS = 599;
 
 /**
  * The discriminator allowlist: `err.type` values the body-parser family sets,
@@ -160,9 +189,41 @@ const PARSER_STATUS_BY_TYPE = Object.freeze({
 });
 
 /**
- * Resolves the HTTP status a failure should produce, in strict precedence
- * order: a typed `HttpError`'s own status, then the parser allowlist keyed on
- * `err.type`, then the masked fallback.
+ * Tests whether a status may be sent for a failure.
+ *
+ * Two distinct failures are prevented, and only one of them is loud. Express 5
+ * throws from `res.status()` for anything that is not an integer from 100 to
+ * 999 -- and it would throw inside this handler, which has nothing after it,
+ * so the request would end with no envelope at all. A value inside Express's
+ * range but outside the failure classes is worse for being silent: a 204 or a
+ * 302 would answer a failure as a success or a redirect, and nothing would
+ * report the contradiction.
+ *
+ * @param {*} status The status an error declared for itself.
+ * @returns {boolean} True when it is an integer in the client-error or
+ *   server-error class and may therefore be sent as it stands.
+ */
+function isSendableErrorStatus(status) {
+  return (
+    Number.isInteger(status) &&
+    status >= MIN_SENDABLE_ERROR_STATUS &&
+    status <= MAX_SENDABLE_ERROR_STATUS
+  );
+}
+
+/**
+ * Resolves both the HTTP status a failure should produce and whether the
+ * failure was expected, in strict precedence order: a typed `HttpError`'s own
+ * status, then the parser allowlist keyed on `err.type`, then the masked
+ * fallback.
+ *
+ * WHY THE ORIGIN IS RETURNED ALONGSIDE THE STATUS, AND NOT DERIVED FROM IT.
+ * The status alone cannot say whether a failure was expected: a deliberate
+ * `HttpError(503)` and an unexpected throw both resolve to the 5xx class, and
+ * they are opposite kinds of event -- one is a decision this service made, the
+ * other is a defect. The exception record below is reserved for the second,
+ * and this function is the only place that still knows which branch was taken,
+ * so it reports it rather than leaving the caller to guess from a number.
  *
  * WHY AN UNRECOGNISED ERROR STAYS A 500. A bare `SyntaxError` -- or anything
  * else carrying no `err.type` -- did not come from the parser, so it is a
@@ -170,6 +231,14 @@ const PARSER_STATUS_BY_TYPE = Object.freeze({
  * be reported to a client as its own mistake. The status stays 500 and the
  * real message is masked in production, while the exception record keeps it
  * for whoever has to fix it.
+ *
+ * WHY A TYPED ERROR'S STATUS IS CHECKED BEFORE IT IS TRUSTED. `err.status` is
+ * an ordinary public field: `HttpError`'s constructor validates what it is
+ * given, but nothing stops a later assignment, and an `instanceof` test says
+ * nothing about the field's current value. An unusable status is therefore
+ * treated as exactly what it is -- a defect in this service -- and resolves to
+ * the unexpected fallback, which both keeps the envelope intact and records
+ * the fault instead of letting it through as a response nobody can explain.
  *
  * `err.status` and `err.statusCode` on a NON-`HttpError` error are pointedly
  * not consulted. Honouring them would look like a harmless generalisation and
@@ -180,15 +249,19 @@ const PARSER_STATUS_BY_TYPE = Object.freeze({
  * @param {*} err The delegated failure. Typically an `Error`, but a handler is
  *   free to call `next()` with any truthy value, so nothing about its shape is
  *   assumed.
- * @returns {number} The status to send, and the value the exception-record and
- *   masking decisions are both taken against.
+ * @returns {{ status: number, unexpected: boolean }} `status` is the value to
+ *   send, and the one the masking decision is taken against. `unexpected` is
+ *   true only for the fallback branch -- an unrecognised failure, or a typed
+ *   one whose status cannot be sent -- and is what gates the exception record.
  */
-function resolveStatus(err) {
-  // Branch one: the raiser chose the status, so it is honoured verbatim. This
-  // covers the 404 from not-found.js and every HttpError(400) from
-  // api.routes.js.
+function resolveFailure(err) {
+  // Branch one: the raiser chose the status, so it is honoured -- once it has
+  // been confirmed sendable. This covers the 404 from not-found.js and every
+  // HttpError(400) from api.routes.js.
   if (err instanceof HttpError) {
-    return err.status;
+    return isSendableErrorStatus(err.status)
+      ? { status: err.status, unexpected: false }
+      : { status: FALLBACK_STATUS, unexpected: true };
   }
 
   // Short-circuited rather than accessed directly: a handler may delegate a
@@ -201,10 +274,10 @@ function resolveStatus(err) {
   // would resolve to an inherited function and be handed to res.status(),
   // which throws. Only the five rows declared above may decide a status.
   if (typeof type === 'string' && Object.hasOwn(PARSER_STATUS_BY_TYPE, type)) {
-    return PARSER_STATUS_BY_TYPE[type];
+    return { status: PARSER_STATUS_BY_TYPE[type], unexpected: false };
   }
 
-  return FALLBACK_STATUS;
+  return { status: FALLBACK_STATUS, unexpected: true };
 }
 
 /**
@@ -227,7 +300,7 @@ function resolveStatus(err) {
  * request, which is the entire purpose of a 4xx.
  *
  * @param {*} err The delegated failure, of any shape.
- * @param {number} status The status already resolved by `resolveStatus`.
+ * @param {number} status The status already resolved by `resolveFailure`.
  * @returns {string} The message for the response envelope. Always a non-empty
  *   string, so the envelope never loses a field.
  */
@@ -300,21 +373,38 @@ function resolveMessage(err, status) {
 function errorHandler(err, req, res, next) {
   // Resolved once and reused. The status decides the masking and the response,
   // and re-deriving it at each use is how two of those decisions come to
-  // disagree about the same failure.
-  const status = resolveStatus(err);
+  // disagree about the same failure. `unexpected` travels with it because the
+  // record below is about the KIND of failure, which the status cannot express.
+  const { status, unexpected } = resolveFailure(err);
 
-  // THE EXCEPTION RECORD, FOR THE 500 CLASS ONLY.
+  // THE EXCEPTION RECORD, FOR UNEXPECTED FAILURES ONLY.
   //
-  // WHY ONLY THE 500 CLASS. Every request already produces exactly one access
+  // WHY NOT EVERY FAILURE. Every request already produces exactly one access
   // record from `requestContext` at position 1, emitted on response completion
   // at a level derived from the status -- `warn` for a 4xx, `error` for a 5xx.
   // A 404 or a rejected body is therefore already recorded, and it is ordinary
   // traffic rather than an incident: duplicating it here at `error` would fill
   // the error stream with routine client mistakes and make it useless for
-  // spotting a real fault. The 500 class is genuinely different, and for a
-  // concrete reason -- its message has just been masked out of the response, so
-  // without this record the only account of what actually failed would be
-  // discarded at the moment it mattered.
+  // spotting a real fault. An unexpected failure is genuinely different, and
+  // for a concrete reason -- its message has just been masked out of the
+  // response, so without this record the only account of what actually failed
+  // would be discarded at the moment it mattered.
+  //
+  // WHY THE GATE IS THE ORIGIN AND NOT THE STATUS CLASS. Gating on `status >=
+  // 500` catches every unexpected failure, and one thing besides: a deliberate
+  // `HttpError` in the 5xx class, which is a handled outcome and would then be
+  // reported twice -- once as ordinary traffic by the access record and once as
+  // an incident here. That is the whole distinction the two-record taxonomy
+  // rests on, so the gate is `unexpected`, which is true for exactly the
+  // fallback branch of `resolveFailure`: an unrecognised failure, or a typed
+  // one whose declared status could not be sent.
+  //
+  // THE CONSEQUENCE, STATED SO IT IS NOT DISCOVERED. A route that deliberately
+  // raises a 5xx `HttpError` gets no exception record, and in production its
+  // message is masked out of the response -- so a route needing that message
+  // preserved must log it at the raise site, where the failure's context is
+  // still in hand. No route in this service raises a 5xx today; every one of
+  // them is a 404 or a 400.
   //
   // WHY `requestId` IS SET EXPLICITLY. It has to be the same value the access
   // record carries, so the two lines describing one failed request can be
@@ -325,12 +415,17 @@ function errorHandler(err, req, res, next) {
   // `req.log` for the same predictability: one record shape, whatever state the
   // request object is in by the time a failure arrives.
   //
-  // `err` is passed under that key deliberately -- pino's default serializer
-  // for `err` captures the message, the type and the stack, which is the whole
-  // point of the record. Nothing else about the request is logged: no headers
-  // and no body, so nothing here can leak a credential the logger's root
-  // redaction policy would otherwise have to catch.
-  if (status >= SERVER_ERROR_MIN_STATUS) {
+  // WHY PASSING THE RAW ERROR UNDER `err` IS SAFE, WHICH IT WOULD NOT BE BY
+  // DEFAULT. pino's own `err` serializer emits the type, message and stack --
+  // and then copies every other enumerable property of the error into the
+  // record, which is how a nested `headers`, `config` or body-parser `body`
+  // reaches a log line with a credential or a payload inside it. This delegated
+  // error is arbitrary: it comes from a route, a library or a parser. What
+  // makes this call site safe is that src/lib/logger.js replaces that default
+  // with an allowlist emitting only type, message, stack and a code or status
+  // -- so the reduction happens once, at the root, for this record and every
+  // other. Nothing else about the request is logged here: no headers, no body.
+  if (unexpected) {
     logger.error(
       {
         err,

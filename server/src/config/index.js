@@ -3,12 +3,14 @@
  * Centralised environment configuration for `hello-world-service`.
  *
  * SINGLE RESPONSIBILITY. This module is the only module in the entire
- * codebase that reads `process.env`. It loads `server/.env`, applies a default
- * for every operator-settable variable, validates every value that was
- * actually supplied, aggregates all failures into one thrown error, and
- * exports one frozen configuration object. Every other module --
- * `src/server.js`, `src/app.js`, `src/lib/logger.js`,
- * `src/middleware/error-handler.js`, `src/routes/health.routes.js` -- obtains
+ * codebase that reads `process.env`. It loads `server/.env` through a
+ * controlled call that isolates dotenv's own reserved control variables,
+ * applies a default for every operator-settable variable, validates every
+ * value that was actually supplied -- including one supplied as an empty
+ * string -- aggregates all failures into one thrown error, and exports one
+ * frozen configuration object. Every other module -- `src/server.js`,
+ * `src/app.js`, `src/lib/logger.js`, `src/middleware/error-handler.js`,
+ * `src/routes/health.routes.js`, `src/routes/metrics.routes.js` -- obtains
  * environment-derived values by requiring this file and reading that object,
  * never by touching `process.env` itself.
  *
@@ -23,7 +25,8 @@
  *
  * WHY THIS FILE IMPORTS NOTHING INTERNAL. In the service's dependency graph
  * this module is a leaf: every edge points at it and it has none of its own
- * beyond the external `dotenv` package. That is deliberate and must stay so.
+ * beyond the external `dotenv` package and the two Node built-ins that
+ * package's controlled invocation needs. That is deliberate and must stay so.
  * `src/lib/logger.js` depends on this file for `logLevel`, `isProduction`,
  * `instance` and `serviceName`, so requiring the logger back from here would
  * close a CommonJS cycle -- and a CommonJS cycle does not throw. It resolves
@@ -48,37 +51,10 @@
 
 'use strict';
 
-/*
- * Load `server/.env` into `process.env` before anything is read.
- *
- * WHY `{ quiet: true }`, AND WHY IT IS NOT COSMETIC. Left to its default,
- * dotenv 17 prints a tips banner to STDOUT on every start (measured at 89
- * bytes with this version). Stdout is the stream this service writes
- * newline-delimited JSON to in production, and every consumer of that stream
- * parses it one line at a time -- so a banner line is not cosmetic noise, it
- * is a corrupt record at the head of the log. `quiet` is the only option
- * passed: no `path`, no `debug`, and deliberately no `override`.
- *
- * WHY NO `override`. dotenv defaults to `override: false`, and that default
- * *is* this service's specified precedence. PM2 injects its descriptor's `env`
- * block into a worker's real environment before any application code runs, so
- * the real environment wins, then `.env`, then the defaults below. The
- * descriptor carries only `NODE_ENV` precisely so that the remaining seven
- * variables stay `.env`-owned; passing `override: true` would invert that
- * settled decision and let a stale `.env` silently defeat the deployment.
- *
- * WHICH FILE IS ACTUALLY LOADED. dotenv resolves `.env` relative to
- * `process.cwd()`, which is invisible from this path and worth stating. Every
- * supported invocation gives `server/` as the cwd -- the npm scripts run from
- * the package directory, and PM2 defaults an application's cwd to its
- * ecosystem file's directory -- so the file read is `server/.env`. That file
- * is an operator artefact copied from the committed `server/.env.example` on
- * the host, and it is git-ignored, so no real value is ever committed. A
- * missing `.env` is not an error: dotenv reports it on the object it returns
- * rather than throwing, and every variable below has a default, so the
- * service starts cleanly with no file at all.
- */
-require('dotenv').config({ quiet: true });
+const fs = require('node:fs');
+const path = require('node:path');
+
+const dotenv = require('dotenv');
 
 /*
  * ---------------------------------------------------------------------------
@@ -92,8 +68,12 @@ require('dotenv').config({ quiet: true });
  * A constant, deliberately -- not an environment read, and not a runtime read
  * of `package.json`. The same string is declared independently in
  * `server/package.json` (`name`) and `server/ecosystem.config.js` (`name`),
- * and it reaches every log line, the `/metrics` output and the `GET /health`
- * response through *this* object rather than through a manifest read. All
+ * and it reaches its three consumers through *this* object rather than through
+ * a manifest read: the logger's base fields, the `GET /health` response, and
+ * the `service` label on every `/metrics` sample. The metrics path is indirect
+ * on purpose -- `src/routes/metrics.routes.js` reads this value and passes it
+ * to `src/lib/metrics.js`'s `render()`, because that counter store is a
+ * dependency-free leaf and must never `require('../config')` itself. All
  * three declarations must therefore carry the same value, or `pm2 status`, the
  * logs and the health response will disagree about what is running.
  *
@@ -327,8 +307,13 @@ const NODE_ENV_VALUES = Object.freeze([
 const LOG_LEVEL_VALUES = Object.freeze(['trace', 'debug', 'info']);
 
 /**
- * The accepted values for `TRUST_PROXY`, matched case-insensitively against
- * the lower-cased input.
+ * The accepted values for `TRUST_PROXY`, matched exactly against the trimmed
+ * input.
+ *
+ * The keys are the two spellings the configuration contract admits, and they
+ * are the only two: matching is case-sensitive for the same reason
+ * NODE_ENV_VALUES is, and the failure message says "exactly", which a
+ * case-folding lookup would have made untrue.
  *
  * @type {Readonly<Object<string, boolean>>}
  */
@@ -352,6 +337,220 @@ const INTEGER_PATTERN = /^-?\d+$/;
  * @type {number}
  */
 const MAX_REPORTED_VALUE_LENGTH = 64;
+
+/*
+ * ---------------------------------------------------------------------------
+ * Environment file loading
+ *
+ * `.env` is loaded by dotenv, but NOT by handing dotenv the ambient
+ * environment and trusting its options. dotenv reserves three variable names
+ * for its own control, reads them out of the very environment it is about to
+ * populate, and lets them win over the options passed at the call site. They
+ * are therefore neutralised around the call rather than assumed inert; the
+ * mechanism and the reason are on loadEnvFile() below.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Name of the environment file this service reads, resolved against the
+ * process's working directory.
+ *
+ * WHICH FILE IS ACTUALLY LOADED, since the path is invisible from here. dotenv
+ * resolves `.env` relative to `process.cwd()`, and every supported invocation
+ * gives `server/` as the cwd -- the npm scripts run from the package
+ * directory, and PM2 defaults an application's cwd to its ecosystem file's
+ * directory -- so the file read is `server/.env`. That file is an operator
+ * artefact copied from the committed `server/.env.example` on the host, and it
+ * is git-ignored, so no real value is ever committed.
+ *
+ * @type {string}
+ */
+const ENV_FILE_NAME = '.env';
+
+/**
+ * Name of dotenv's encrypted-vault file, which this service does NOT support
+ * as a configuration source.
+ *
+ * It is named here for exactly one purpose: to detect that an operator has
+ * staged one. See the `DOTENV_KEY` handling in loadEnvFile().
+ *
+ * @type {string}
+ */
+const ENV_VAULT_FILE_NAME = '.env.vault';
+
+/**
+ * The `error.code` from a failed `.env` read that is NOT a failure: the file
+ * simply is not there.
+ *
+ * Every variable in this module has a default, so a process with no `.env` at
+ * all is fully configured. This is the one read outcome that is tolerated --
+ * every other code means a file exists but could not be turned into
+ * configuration, which is an operator error and must stop start-up.
+ *
+ * @type {string}
+ */
+const ENV_FILE_ABSENT_CODE = 'ENOENT';
+
+/**
+ * The three variable names dotenv reserves for its own control, all of which
+ * this module neutralises before loading and restores afterwards.
+ *
+ * WHY EACH ONE IS DANGEROUS HERE, verified against dotenv 17.4.2's
+ * `lib/main.js` rather than inferred from its documentation:
+ *
+ *   * `DOTENV_CONFIG_QUIET` and `DOTENV_CONFIG_DEBUG` are resolved as
+ *     `parseBoolean(processEnv.DOTENV_CONFIG_* || options.*)`, so an ambient
+ *     value BEATS the literal option passed at the call site -- and both are
+ *     read a second time AFTER `.env` has been populated, so a value inside
+ *     `.env` beats it too. Either one re-enables dotenv's banner and debug
+ *     lines, which it writes with `console.log`, i.e. to STDOUT. Stdout is the
+ *     stream this service writes newline-delimited JSON to in production, and
+ *     every consumer parses it one line at a time, so such a line is not
+ *     cosmetic noise: it is a corrupt record at the head of the log.
+ *   * `DOTENV_KEY` is read BEFORE `.env` is opened and switches loading to the
+ *     encrypted `.env.vault` file. With one staged, `.env` is never read at
+ *     all and a decryption failure surfaces as a raw crypto exception rather
+ *     than as a configuration message.
+ *
+ * Neutralising them is what makes `server/.env.example`'s claim to list the
+ * whole configuration surface true: without it, three further variables would
+ * silently change how this service loads and logs.
+ *
+ * @type {ReadonlyArray<string>}
+ */
+const DOTENV_RESERVED_NAMES = Object.freeze([
+  'DOTENV_CONFIG_QUIET',
+  'DOTENV_CONFIG_DEBUG',
+  'DOTENV_KEY'
+]);
+
+/**
+ * The values forced onto dotenv's two output controls for the duration of the
+ * load.
+ *
+ * They are assigned into `process.env` rather than passed as options, because
+ * that is the only channel dotenv actually consults last: it re-reads both
+ * names from the environment after populating `.env`, and its populate step
+ * will not overwrite a name that is already an own property when `override` is
+ * false. Seeding them therefore pins both controls against the ambient
+ * environment AND against the file's own contents.
+ *
+ * @type {Readonly<Object<string, string>>}
+ */
+const DOTENV_FORCED_CONTROLS = Object.freeze({
+  DOTENV_CONFIG_QUIET: 'true',
+  DOTENV_CONFIG_DEBUG: 'false'
+});
+
+/**
+ * Loads `server/.env` into `process.env` under controlled conditions, and
+ * records a failure for every load problem that is not simply "no file".
+ *
+ * Called once, as the FIRST step of loadConfiguration(), because every reader
+ * below observes `process.env` after this has run. It follows the same
+ * never-throw contract as the readers: problems are pushed onto the
+ * accumulator so they arrive in the one aggregated error alongside any invalid
+ * value.
+ *
+ * WHAT IT DOES, AND WHY THE PLAIN CALL IS NOT ENOUGH. `dotenv.config({ quiet:
+ * true })` is the specified load, and the option means what it says only while
+ * dotenv's three reserved control variables are absent -- see
+ * DOTENV_RESERVED_NAMES for the mechanism by which each of them overrides it.
+ * So the reserved names are removed from the environment, the two output
+ * controls are pinned to safe values, the specified call is made, and the
+ * originals are put back in a `finally` so this module leaves the environment
+ * exactly as it found it and no reserved name that arrived from `.env` is
+ * allowed to persist.
+ *
+ * WHAT IT DELIBERATELY DOES NOT CHANGE. `override` is still absent, so dotenv
+ * keeps its default of `override: false`, and that default *is* this service's
+ * specified precedence: PM2 injects its descriptor's `env` block into a
+ * worker's real environment before any application code runs, so the real
+ * environment wins, then `.env`, then the defaults above. The descriptor
+ * carries only `NODE_ENV` precisely so the remaining seven variables stay
+ * `.env`-owned; `override: true` would invert that settled decision and let a
+ * stale `.env` silently defeat the deployment. `.env` values still land in
+ * `process.env`, so nothing downstream of this module sees a different
+ * environment than it would have.
+ *
+ * WHY THE RETURN VALUE IS INSPECTED. dotenv reports a failed read on the
+ * object it returns rather than by throwing, so discarding that object makes
+ * an existing-but-unusable `.env` -- wrong permissions, a directory of that
+ * name, an I/O error -- indistinguishable from no file at all, and the service
+ * would start on defaults the operator never chose. Only `ENOENT` is
+ * tolerated; every other code is a failure.
+ *
+ * @param {string[]} failures Accumulator that failure messages are pushed onto.
+ * @returns {void}
+ */
+function loadEnvFile(failures) {
+  const envPath = path.resolve(process.cwd(), ENV_FILE_NAME);
+  const vaultPath = path.resolve(process.cwd(), ENV_VAULT_FILE_NAME);
+  const dotenvKey = process.env.DOTENV_KEY;
+
+  // A neutralised `DOTENV_KEY` is only a silently changed source if a vault
+  // file is actually there to load: with none, dotenv would have fallen back
+  // to `.env` anyway, so an unrelated key exported on a shared host must not
+  // stop this service. With one staged, the operator has plainly prepared a
+  // source this service does not read, and quietly ignoring that is the same
+  // class of surprise as quietly honouring it -- so it is reported instead.
+  if (typeof dotenvKey === 'string' && dotenvKey.length > 0 &&
+      fs.existsSync(vaultPath)) {
+    failures.push(
+      `DOTENV_KEY is set and ${ENV_VAULT_FILE_NAME} exists at ${vaultPath}, ` +
+        `but this service reads configuration only from ${ENV_FILE_NAME}; ` +
+        `unset DOTENV_KEY or remove ${ENV_VAULT_FILE_NAME}`
+    );
+  }
+
+  const saved = new Map();
+
+  for (const name of DOTENV_RESERVED_NAMES) {
+    if (Object.prototype.hasOwnProperty.call(process.env, name)) {
+      saved.set(name, process.env[name]);
+    }
+
+    delete process.env[name];
+  }
+
+  Object.assign(process.env, DOTENV_FORCED_CONTROLS);
+
+  let result;
+
+  try {
+    result = dotenv.config({ quiet: true });
+  } finally {
+    // Unconditional, and in a `finally` so it holds even if dotenv throws:
+    // the forced controls are scaffolding for one call, and a reserved name
+    // that arrived from `.env` must not outlive it.
+    for (const name of DOTENV_RESERVED_NAMES) {
+      delete process.env[name];
+
+      if (saved.has(name)) {
+        process.env[name] = saved.get(name);
+      }
+    }
+  }
+
+  const error = result.error;
+
+  if (error !== undefined && error !== null &&
+      error.code !== ENV_FILE_ABSENT_CODE) {
+    // A Node file-system error's `message` already opens with its `code`
+    // (`EISDIR: illegal operation on a directory, read`), so quoting both
+    // prints the code twice; the message is the more informative of the two
+    // and is used alone, with the code as the fallback if a thrown value ever
+    // arrives without one.
+    const detail = typeof error.message === 'string' && error.message.length > 0
+      ? error.message
+      : `code ${String(error.code)}`;
+
+    failures.push(
+      `${ENV_FILE_NAME} exists at ${envPath} but could not be read ` +
+        `(${describeValue(detail)}); fix or remove the file`
+    );
+  }
+}
 
 /*
  * ---------------------------------------------------------------------------
@@ -390,31 +589,43 @@ function describeValue(raw) {
 }
 
 /**
- * Reads one environment variable, trimmed, treating "supplied but empty" as
- * absent.
+ * Reads one environment variable, trimmed, distinguishing a variable that was
+ * never set from one that was set to nothing.
  *
- * This is the single point at which this codebase touches `process.env`; every
- * reader below goes through it, and no other module has any business calling
- * anything like it.
+ * This is the single point at which this codebase touches `process.env` for a
+ * configuration variable; every reader below goes through it, and no other
+ * module has any business calling anything like it.
  *
- * WHY EMPTY MEANS ABSENT. An operator who leaves `PORT=` in a `.env` file
- * means "I did not set this", and aborting start-up over an empty assignment
- * would be a hostile reading of it -- commenting a line out and blanking its
- * value are the same intent expressed two ways. A value that is empty or
- * whitespace-only after trimming is therefore treated exactly as if the
- * variable had never been set, and the documented default applies: `PORT=`
- * yields 3000, it does not yield a validation failure. This is a deliberate
- * decision about how to read an ambiguous input, not a side effect of the
- * parsing.
+ * WHY A SUPPLIED EMPTY VALUE IS A FAILURE RATHER THAN AN ABSENCE. The rule
+ * this module enforces is that nothing is mandatory but ANYTHING SUPPLIED MUST
+ * BE VALID, and `PORT=` is supplied -- the variable is present in the
+ * environment, holding a value that satisfies no validator. Reading it as
+ * absence would make every per-variable rule skippable by blanking the value
+ * instead of correcting it, and it is a blank rather than a typo that a
+ * machine produces: an unexpanded template placeholder, a substitution against
+ * an unset variable, a deploy tool writing an absent secret through. Silently
+ * substituting a default there means binding a port nobody chose, or falling
+ * back to the all-interfaces `HOST` default when a deployment meant to
+ * restrict the listener to loopback -- both of which look like a healthy
+ * start-up. Refusing to start says what actually happened. It also keeps
+ * `HOST`'s "non-empty string" rule enforceable: this is the single place a
+ * blank can be detected, so this is where that rule lives.
+ *
+ * An operator who wants the default removes the assignment; that is what
+ * absence means and it is the one line in `server/.env.example` to delete.
  *
  * Every value is trimmed before validation, so stray whitespace around an
- * otherwise valid value in a `.env` line can never turn it into a failure.
+ * otherwise valid value in a `.env` line can never turn it into a failure --
+ * and a value that is nothing BUT whitespace is a blank, handled as above.
  *
  * @param {string} name The environment variable name, e.g. `'PORT'`.
- * @returns {string|undefined} The trimmed value, or `undefined` when the
- *                             variable is unset, empty or whitespace-only.
+ * @param {string[]} failures Accumulator that a failure message is pushed onto
+ *                            when the variable is supplied but blank.
+ * @returns {string|undefined} The trimmed, non-empty value; `undefined` when
+ *                             the variable is unset, or when a failure was
+ *                             recorded.
  */
-function readRaw(name) {
+function readRaw(name, failures) {
   const raw = process.env[name];
 
   if (typeof raw !== 'string') {
@@ -423,7 +634,20 @@ function readRaw(name) {
 
   const trimmed = raw.trim();
 
-  return trimmed.length === 0 ? undefined : trimmed;
+  if (trimmed.length === 0) {
+    // Only the variable-specific fact belongs here. The aggregated message
+    // this is folded into already tells the operator that every variable is
+    // optional and that removing the assignment is the fix, so repeating it
+    // per failure would say it three times for three blank variables.
+    failures.push(
+      `${name} was supplied but is empty; blanking a value is not the same ` +
+        'as omitting it'
+    );
+
+    return undefined;
+  }
+
+  return trimmed;
 }
 
 /**
@@ -443,7 +667,7 @@ function readRaw(name) {
  *                             recorded.
  */
 function readInteger(name, failures) {
-  const raw = readRaw(name);
+  const raw = readRaw(name, failures);
 
   if (raw === undefined) {
     return undefined;
@@ -558,7 +782,7 @@ function readNonNegativeInteger(name, failures) {
  *                             recorded.
  */
 function readEnum(name, allowed, failures) {
-  const raw = readRaw(name);
+  const raw = readRaw(name, failures);
 
   if (raw === undefined) {
     return undefined;
@@ -577,8 +801,8 @@ function readEnum(name, allowed, failures) {
 }
 
 /**
- * Reads a variable as a strict boolean, accepting only the exact words `true`
- * and `false` (case-insensitively) and returning a real boolean.
+ * Reads a variable as a strict boolean, accepting only the exact lowercase
+ * words `true` and `false` and returning a real boolean.
  *
  * WHY THE COERCION IS STRICT RATHER THAN CONVENIENT. `1`, `0`, `yes`, `no`,
  * `on` and `off` are all rejected, and the returned value is a genuine
@@ -590,6 +814,16 @@ function readEnum(name, allowed, failures) {
  * as `TRUST_PROXY=flase` gets the same treatment: rejected loudly at start-up,
  * rather than guessed at and quietly resolved to the dangerous side.
  *
+ * WHY THE MATCH IS CASE-SENSITIVE. The configuration contract admits the two
+ * spellings `true` and `false` and no others, and this function's own failure
+ * message promises exactly that -- so folding `TRUE` or `FaLsE` into an
+ * accepted value would make the code disagree both with the contract it
+ * implements and with the message it prints. It would also make this the one
+ * variable read leniently while `NODE_ENV` and `LOG_LEVEL` are compared
+ * exactly, and that local inconsistency is what turns a rejected
+ * `NODE_ENV=Production` into a surprise. A spelling this rejects is a
+ * one-character fix the operator is told about at start-up.
+ *
  * @param {string} name The environment variable name.
  * @param {string[]} failures Accumulator that a failure message is pushed onto.
  * @returns {boolean|undefined} The parsed boolean; `undefined` when the
@@ -597,16 +831,14 @@ function readEnum(name, allowed, failures) {
  *                              recorded.
  */
 function readBoolean(name, failures) {
-  const raw = readRaw(name);
+  const raw = readRaw(name, failures);
 
   if (raw === undefined) {
     return undefined;
   }
 
-  const normalised = raw.toLowerCase();
-
-  if (Object.prototype.hasOwnProperty.call(BOOLEAN_VALUES, normalised)) {
-    return BOOLEAN_VALUES[normalised];
+  if (Object.prototype.hasOwnProperty.call(BOOLEAN_VALUES, raw)) {
+    return BOOLEAN_VALUES[raw];
   }
 
   failures.push(
@@ -615,39 +847,6 @@ function readBoolean(name, failures) {
   );
 
   return undefined;
-}
-
-/**
- * Reads a variable that must be a non-empty string.
- *
- * The emptiness check looks redundant against readRaw(), which already maps an
- * empty or whitespace-only value to `undefined`, and today it can never fire.
- * It is kept as an explicit guard rather than removed because it states the
- * invariant the consumer depends on -- `config.host` is never the empty
- * string, and a listener is never asked to bind nothing. If readRaw's
- * empty-means-absent rule is ever revisited, this check is what stops that
- * change from reaching the socket.
- *
- * @param {string} name The environment variable name.
- * @param {string[]} failures Accumulator that a failure message is pushed onto.
- * @returns {string|undefined} The validated string; `undefined` when the
- *                             variable is absent, or when a failure was
- *                             recorded.
- */
-function readNonEmptyString(name, failures) {
-  const raw = readRaw(name);
-
-  if (raw === undefined) {
-    return undefined;
-  }
-
-  if (raw.length === 0) {
-    failures.push(`${name} must be a non-empty string`);
-
-    return undefined;
-  }
-
-  return raw;
 }
 
 /**
@@ -686,19 +885,20 @@ function resolveBodyLimitBytes(raw) {
  * in the log stream harder to relate back to `.env`. The string is what is
  * exported; the byte count never leaves this function.
  *
- * Three distinct rejections, in the order they are checked:
+ * Two distinct rejections, in the order they are checked:
  *   1. the grammar -- `10gb` and `abc` fail here, before any arithmetic;
- *   2. zero -- see below;
- *   3. the ceiling -- `2mb` is well-formed and still refused, while `1mb`
+ *   2. the ceiling -- `2mb` is well-formed and still refused, while `1mb`
  *      resolves to exactly the ceiling and is accepted.
  *
- * WHY ZERO IS REFUSED. This is a local decision rather than a requirement
- * handed down: a limit of zero bytes would reject every request that carried
- * a body at all, turning a memory bound into a blanket kill switch for the
- * service's only write endpoint. No operator wants that outcome from a field
- * named "limit", so `0` and `0kb` are treated as configuration mistakes. An
- * operator who genuinely wants to refuse bodies has route-level and
- * proxy-level ways to say so that do not disguise themselves as a size.
+ * AND NOTHING ELSE. The contract for this variable is the grammar plus the
+ * ceiling, so every value those two admit is accepted -- `0` and `0kb`
+ * included. A zero limit is an unusual choice rather than an invalid one: it
+ * makes the parsers reject any request carrying a body, which is a coherent
+ * thing for an operator to ask of a size limit and is reported to the caller
+ * as the ordinary 413 that any oversized body earns. Adding a local one-byte
+ * minimum here would refuse a start-up the specified contract permits, and a
+ * validator that is stricter than the contract it enforces is a defect
+ * whichever direction it errs in.
  *
  * @param {string} name The environment variable name.
  * @param {string[]} failures Accumulator that a failure message is pushed onto.
@@ -707,7 +907,7 @@ function resolveBodyLimitBytes(raw) {
  *                             was recorded.
  */
 function readBodyLimit(name, failures) {
-  const raw = readRaw(name);
+  const raw = readRaw(name, failures);
 
   if (raw === undefined) {
     return undefined;
@@ -725,15 +925,6 @@ function readBodyLimit(name, failures) {
     return undefined;
   }
 
-  if (bytes === 0) {
-    failures.push(
-      `${name} must resolve to at least one byte ` +
-        `(received "${describeValue(raw)}")`
-    );
-
-    return undefined;
-  }
-
   if (bytes > BODY_LIMIT_MAX_BYTES) {
     failures.push(
       `${name} must resolve to at most ${BODY_LIMIT_MAX_BYTES} bytes (1 MB), ` +
@@ -745,7 +936,6 @@ function readBodyLimit(name, failures) {
 
   return raw;
 }
-
 
 /*
  * ---------------------------------------------------------------------------
@@ -793,8 +983,9 @@ function readBodyLimit(name, failures) {
  *           consumed inside the drain budget. From `DRAIN_DELAY_MS`; default
  *           2000; 0 to `shutdownTimeoutMs - 1000`.
  * @property {string} bodyLimit Maximum request body size, as a string for
- *           Express's parsers. From `BODY_LIMIT`; default `'100kb'`; resolves
- *           to at most 1048576 bytes and at least one byte.
+ *           Express's parsers. From `BODY_LIMIT`; default `'100kb'`; matches
+ *           `^\d+(kb|mb)?$` case-insensitively and resolves to at most
+ *           1048576 bytes.
  * @property {boolean} trustProxy Whether Express trusts `X-Forwarded-*`
  *           headers. From `TRUST_PROXY`; default `false`.
  * @property {number} instance Cluster worker ordinal. From
@@ -813,7 +1004,8 @@ function readBodyLimit(name, failures) {
  * problem it finds in one error.
  *
  * Invoked once, during module evaluation, immediately below -- not exported
- * and not deferred. Two behaviours define it:
+ * and not deferred. It loads `.env` first, then reads every variable. Two
+ * behaviours define it:
  *
  *   * NOTHING IS MANDATORY. Every variable has a default, so a process with no
  *     `.env` file and an empty environment is fully configured and starts
@@ -822,7 +1014,9 @@ function readBodyLimit(name, failures) {
  *     Each reader records its own problem and returns `undefined` instead of
  *     throwing, so validation always runs to completion. An operator who has
  *     mistyped three variables is told about three, not asked to fix one and
- *     restart to discover the next.
+ *     restart to discover the next. "Supplied" includes supplied empty: a
+ *     variable present in the environment holding a blank value is a failure,
+ *     not an absence -- see readRaw().
  *
  * `??` is used throughout rather than `||`, and the distinction is not
  * stylistic: `drainDelayMs` may legitimately be 0 and `trustProxy` may
@@ -834,15 +1028,35 @@ function readBodyLimit(name, failures) {
  * @throws {Error} If any supplied value is invalid. The message is a single
  *                 line naming every failing variable and why; a frozen
  *                 `failures` array of the individual messages is attached for
- *                 a caller that wants them separately.
+ *                 a caller that wants them separately; and `code` is set to
+ *                 `ERR_CONFIG_VALIDATION` so a caller can tell this
+ *                 deliberate rejection apart from a failure to load this
+ *                 module at all.
  */
 function loadConfiguration() {
   /** @type {string[]} */
   const failures = [];
 
+  // FIRST, and necessarily first: every reader below observes `process.env`,
+  // so `.env` has to be in it before any of them run. A load problem is
+  // pushed onto the same accumulator as an invalid value, so an operator whose
+  // `.env` is unreadable AND whose real environment holds a bad `PORT` is told
+  // about both at once.
+  loadEnvFile(failures);
+
   const port = readBoundedInteger('PORT', PORT_MIN, PORT_MAX, failures) ??
     DEFAULTS.port;
-  const host = readNonEmptyString('HOST', failures) ?? DEFAULTS.host;
+
+  // `HOST`'s rule in the configuration contract is "non-empty string", and
+  // readRaw() is where that rule is enforced: it trims, and it records a
+  // failure for a value that is empty or whitespace-only rather than falling
+  // back to the default. Everything it returns is therefore already a trimmed,
+  // non-empty string, so `config.host` is never the empty string and a
+  // listener is never asked to bind nothing. A second emptiness check here
+  // would be unreachable, which is why no separate non-empty-string reader
+  // exists for it.
+  const host = readRaw('HOST', failures) ?? DEFAULTS.host;
+
   const nodeEnv = readEnum('NODE_ENV', NODE_ENV_VALUES, failures) ??
     DEFAULTS.nodeEnv;
   const logLevel = readEnum('LOG_LEVEL', LOG_LEVEL_VALUES, failures) ??
@@ -907,10 +1121,14 @@ function loadConfiguration() {
   //
   // WHY IT DEFAULTS TO 0 RATHER THAN BEING OMITTED. A directly launched
   // process reports `instance: 0` rather than dropping the field, so the
-  // `GET /health` response, the `/metrics` output and every log line have the
-  // SAME SHAPE whether or not PM2 launched the process. A consumer parsing
-  // those never has to handle an absent field, and a query written against
-  // production logs works unchanged against a developer's local run.
+  // `GET /health` response, every log line and the `instance` label on every
+  // `/metrics` sample have the SAME SHAPE whether or not PM2 launched the
+  // process. A consumer parsing those never has to handle an absent field, and
+  // a query written against production logs works unchanged against a
+  // developer's local run. The label reaches the exposition as an ARGUMENT,
+  // not an import: `src/routes/metrics.routes.js` passes this value into
+  // `src/lib/metrics.js`'s `render()`, which stays a dependency-free leaf and
+  // must never `require('../config')`.
   const instance = readNonNegativeInteger('NODE_APP_INSTANCE', failures) ??
     DEFAULTS.instance;
 
@@ -929,6 +1147,18 @@ function loadConfiguration() {
         'server/.env.example is the contract.'
     );
 
+    // THE DISCRIMINATOR, WHICH IS A PAIRED OBLIGATION WITH `src/server.js`.
+    // That module guards this require and has to tell an invalid environment
+    // -- an operator error, fixed in `server/.env` -- apart from anything else
+    // thrown while this module is evaluated, such as a missing `dotenv` or a
+    // defect in the code here, which is fixed in the tree and located by its
+    // stack. Without a stable marker the two are indistinguishable in the
+    // catch, and the second gets reported as the first with its stack thrown
+    // away. `code` carries it, in the Node convention, because this is
+    // deliberately a plain `Error`: this module exports a frozen object and no
+    // error class, so there is nothing for an `instanceof` check to test, and
+    // the message is prose that will eventually be reworded.
+    error.code = 'ERR_CONFIG_VALIDATION';
     error.failures = Object.freeze(failures.slice());
 
     throw error;
@@ -976,4 +1206,3 @@ function loadConfiguration() {
  * @type {Readonly<ServiceConfig>}
  */
 module.exports = Object.freeze(loadConfiguration());
-

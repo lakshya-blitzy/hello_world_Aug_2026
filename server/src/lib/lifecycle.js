@@ -12,10 +12,22 @@
 // Two layers share this flag, and they sit on opposite sides of the
 // application:
 //
-//   * src/server.js                -- the SIGTERM/SIGINT handler, which SETS it
+//   * src/server.js                -- the SIGTERM/SIGINT handler, which SETS
+//                                     it through beginShutdown(), and which
+//                                     also READS it at exactly one point: the
+//                                     listen callback, which must not announce
+//                                     a worker to PM2 as ready when a signal
+//                                     has already begun draining it while the
+//                                     bind was still pending
 //   * src/routes/health.routes.js  -- the readiness route, which READS it to
 //                                     answer 200 "ready" or 503
 //                                     "shutting_down"
+//
+// The two reads ask the same question for different purposes and must not be
+// consolidated: the process layer's read decides whether a PM2 readiness
+// message may be sent, and the route layer's read decides what an HTTP probe is
+// told. Neither owns the other's answer, which is why the state lives here
+// rather than in either of them.
 //
 // WHY THIS MODULE EXISTS AT ALL. Do not "tidy up" by folding the flag into
 // src/server.js. Doing so forces the readiness route to import the process
@@ -60,6 +72,11 @@ let shuttingDown = false;
  * `{ status: "shutting_down" }` while the listener is still accepting, which is
  * what lets a poller observe the negative answer and stop sending new work
  * before the socket closes.
+ *
+ * src/server.js calls it for a different decision on the same fact: a `true`
+ * here when a pending bind finally completes means the drain got there first,
+ * so the worker withholds its PM2 readiness message instead of advertising
+ * itself as up while it is already going down.
  *
  * @returns {boolean} `true` once a drain has begun, otherwise `false`.
  */

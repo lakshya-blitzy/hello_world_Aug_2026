@@ -40,13 +40,15 @@
  *     this router.
  *
  * WHAT THIS MODULE DELIBERATELY DOES NOT DO. It declares no route handler of
- * its own -- no `router.get`, no `router.post` -- and registers no middleware.
- * It reads no configuration and touches no environment, writes no log line,
- * formats no error and validates no input. Every one of those belongs to a
- * module that already owns it, and adding any of them here would turn a
- * composition layer into a second, competing place to look for behaviour. Its
- * only import beyond the four siblings is `express`, needed for
- * `express.Router()` alone.
+ * its own -- no `router.get`, no `router.post` -- and defines no standalone
+ * middleware of its own: the only things it registers are the four child
+ * routers below, each mounted with `router.use()`, which express records as a
+ * middleware layer on this Router. It reads no configuration and touches no
+ * environment, writes no log line, formats no error and validates no input.
+ * Every one of those belongs to a module that already owns it, and adding any
+ * of them here would turn a composition layer into a second, competing place
+ * to look for behaviour. Its only import beyond the four siblings is
+ * `express`, needed for `express.Router()` alone.
  *
  * CONSISTENCY OBLIGATION. `server/README.md`'s endpoint-reference table is the
  * canonical, single-location documentation of this URL map. This file is the
@@ -56,8 +58,9 @@
 'use strict';
 
 // Required for `express.Router()` alone. No other part of the express surface
-// is used here: this module creates no application, binds no port and
-// registers no middleware.
+// is used here: this module creates no application, binds no port and defines
+// no middleware of its own -- the only layers it registers are the four child
+// router mounts below.
 const express = require('express');
 
 // The four route modules, required as siblings with no file extension so
@@ -86,9 +89,22 @@ const apiRoutes = require('./api.routes');
  * breaks the application factory.
  *
  * No options are passed: this router declares no parameterised path, so it
- * needs no `mergeParams`, and omitting `caseSensitive` and `strict` lets every
- * mount inherit the application's settings, which is what keeps path matching
- * consistent across the whole URL space.
+ * needs no `mergeParams`, and its `caseSensitive` and `strict` matching
+ * options therefore take THIS Router's own defaults -- both disabled -- and
+ * not the application's. A child Router does NOT inherit them: express reads
+ * `case sensitive routing` and `strict routing` only when it lazily builds the
+ * application's own router, while `express.Router()` copies `caseSensitive`
+ * and `strict` straight out of the option object it is handed, which is absent
+ * here.
+ *
+ * What actually keeps path matching consistent across the whole URL space is
+ * that NOTHING in this service enables either option -- `../app.js` sets only
+ * `trust proxy` and disables `x-powered-by`, and all five Routers (this one
+ * and the four it mounts) are constructed with no options -- so every mount
+ * matches case-insensitively and tolerates a trailing slash. Enabling either
+ * setting on the application alone would therefore NOT change matching here;
+ * it would have to be passed explicitly to this Router and to every child
+ * Router that needs it.
  *
  * @type {import('express').Router}
  */

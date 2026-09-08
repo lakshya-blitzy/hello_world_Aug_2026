@@ -202,7 +202,9 @@ const httpLogger = pinoHttp({ logger, genReqId, customLogLevel });
  *   * guarantees exactly ONE access record, emitted on response completion at
  *     the level `customLogLevel()` chooses;
  *   * writes the request counters, of which it is the sole writer, pairing
- *     every accepted request with exactly one completion.
+ *     every accepted request with exactly one finish -- supplying the response
+ *     status for the status-class bucket only when the response actually
+ *     completed, so an aborted connection is not tallied as a success.
  *
  * It never sends a response, never inspects a route and always delegates.
  *
@@ -236,12 +238,20 @@ function requestContext(req, res, next) {
    * pair correctly; a `'finish'`-only hook never fires for an abort and leaks
    * the gauge on the traffic hardest to notice.
    *
-   * WHY NOT COUNT FROM A PINO-HTTP HOOK: `customLogLevel`,
-   * `customSuccessMessage` and `customErrorMessage` are tied to log EMISSION --
-   * a message hook is skipped when the record is filtered out by level, so the
-   * counters would silently depend on the logging threshold -- and a
-   * level-DECISION function performing a side effect fuses two unrelated
-   * concerns. Measurement stays on the response's own lifecycle event.
+   * WHY NOT COUNT FROM A PINO-HTTP HOOK -- `customLogLevel`,
+   * `customSuccessMessage` or `customErrorMessage`. Not because those hooks
+   * fail to run: in pino-http 11.0.0 the object and message providers are
+   * evaluated while the log call's arguments are being assembled, BEFORE
+   * `log[level](...)` is reached, so ordinary level filtering does not skip
+   * them. The reason is that they are part of the AUTO-LOGGING configuration,
+   * and measurement must not be. Every one of them stops being called if
+   * `autoLogging` is ever set to `false` or given an `ignore` predicate -- the
+   * "skip health-check noise" change someone will eventually propose -- and
+   * the counters would then go quietly wrong with no failing request and no
+   * error to notice. Separately, `customLogLevel` is a level-DECISION function,
+   * and giving it a side effect fuses two unrelated concerns in a callback
+   * whose contract is to return a string. Measurement stays on the response's
+   * own lifecycle event, which no logging option can switch off.
    */
   let counted = false;
 
@@ -256,10 +266,30 @@ function requestContext(req, res, next) {
     }
     counted = true;
 
-    // Read inside the handler: by completion `res.statusCode` is the final
-    // status the client saw, which is the value the per-class bucket needs. Read
-    // any earlier it would still be the default 200.
-    recordRequestEnd(res.statusCode);
+    // A STATUS ONLY FOR A RESPONSE THAT ACTUALLY COMPLETED, and this gate is
+    // the whole reason the `'close'` event can serve both outcomes.
+    //
+    // `'close'` fires for a completed response AND for a connection the client
+    // destroyed mid-flight, which is what makes the pairing above correct --
+    // but the two cases carry very different status codes. On a completed
+    // response `res.statusCode` is the final status the client saw, exactly
+    // what the per-class bucket needs. On an abort it is whatever the value
+    // happened to be when the socket died, and if the handler had not responded
+    // yet, that is Node's UNTOUCHED DEFAULT OF 200 -- so passing it
+    // unconditionally files abandoned requests in the `2xx` bucket and reports
+    // dropped traffic as success.
+    //
+    // `res.writableFinished` is the discriminator: it turns true only once the
+    // response has been fully flushed to the socket, so it is precisely the
+    // "completed" that `http_requests_by_status_class_total` claims to count.
+    // `undefined` is the store's documented abort signal -- it lowers the
+    // in-flight gauge and tallies no bucket. Note the deliberate boundary: a
+    // client that aborts after the headers were sent but before the body
+    // finished is also counted as not completed, even though a status did reach
+    // it. That is the honest reading of "completed", and it keeps this gate a
+    // single unambiguous test rather than a guess about how much of the
+    // response the client actually received.
+    recordRequestEnd(res.writableFinished ? res.statusCode : undefined);
   });
 
   // Delegate last, so identity and counting are established for the request

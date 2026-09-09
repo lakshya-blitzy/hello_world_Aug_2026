@@ -58,7 +58,7 @@ const config = require('../config');
 /**
  * The router this module exports.
  *
- * A bare `express.Router()` carrying the two routes registered below. One
+ * An `express.Router()` carrying the two routes registered below. One
  * instance per process, created at require time: a Router is stateless with
  * respect to requests, so a single shared instance is correct and a factory
  * would buy nothing. It is exported by direct assignment
@@ -67,9 +67,29 @@ const config = require('../config');
  * Router value -- not a wrapper object, not `{ router }`, and not a factory
  * that has to be invoked first. Any other export shape breaks that mount.
  *
+ * WHY THE TWO OPTIONS ARE HERE, and this Router is the one where they matter
+ * most. A Router matches by the options it is constructed with, and nothing
+ * hands them down: the application's `case sensitive routing` /
+ * `strict routing` settings govern only the router `../app.js` owns, and
+ * `./index.js`'s options govern only the `/health` mount path. The `'/ready'`
+ * route below is matched with the options on this line and nowhere else --
+ * this is the only leaf path in the whole service with a name of its own -- so
+ * without `caseSensitive: true` the service answers `GET /health/READY`, a
+ * spelling its contract does not declare and one that an exact proxy or probe
+ * rule written against `/health/ready` would not match.
+ *
+ * `strict: true` is its pair, and its effect here is defence in depth rather
+ * than a distinct behaviour: the trailing-slash spellings `/health/` and
+ * `/health/ready/` are already refused before this Router is entered, by
+ * `./index.js`'s request-target gate. That gate has to own them, because
+ * mounting strips the `/health` prefix and normalises what is left, so this
+ * Router cannot tell `/health` from `/health/`. Setting `strict` here keeps
+ * the exactness true for any leaf path added later and independently of that
+ * gate's rules.
+ *
  * @type {import('express').Router}
  */
-const router = express.Router();
+const router = express.Router({ caseSensitive: true, strict: true });
 
 /**
  * Writes one probe response: the status, the JSON body, the two headers that

@@ -68,19 +68,45 @@ const { render } = require('../lib/metrics');
 /**
  * The router this module exports.
  *
- * A bare `express.Router()` carrying the one route registered below. One
- * instance per process, created at require time: a Router is stateless with
- * respect to requests, so a single shared instance is correct and a factory
- * would buy nothing. It is exported by direct assignment
- * (`module.exports = router`) because the aggregator in `./index.js` mounts
- * the required value directly, with `router.use('/metrics', metricsRoutes)`,
- * which needs a mountable Router -- not a wrapper object, not `{ router }`,
- * and not a factory that has to be invoked first. Any other export shape
- * breaks that mount.
+ * An `express.Router()` carrying the one route registered below. One instance
+ * per process, created at require time: a Router is stateless with respect to
+ * requests, so a single shared instance is correct and a factory would buy
+ * nothing. It is exported by direct assignment (`module.exports = router`)
+ * because the aggregator in `./index.js` mounts the required value directly,
+ * with `router.use('/metrics', metricsRoutes)`, which needs a mountable Router
+ * -- not a wrapper object, not `{ router }`, and not a factory that has to be
+ * invoked first. Any other export shape breaks that mount.
+ *
+ * WHY THE TWO OPTIONS ARE HERE AND NOT INHERITED FROM ANYWHERE. A Router
+ * matches by the options it is constructed with, and nothing hands them down:
+ * the application's `case sensitive routing` / `strict routing` settings
+ * configure only the router `../app.js` itself owns, and `./index.js`'s own
+ * options govern only the mount path `/metrics`. Anything this file declares
+ * is matched with the options on this line.
+ *
+ * WHAT THEY ACHIEVE HERE TODAY, stated exactly rather than generously: this
+ * Router declares one route and its path is `'/'`, so neither option changes a
+ * response on its own. The spellings of `/metrics` that the contract does not
+ * declare are refused before this Router is entered -- `/METRICS` and its case
+ * variants by the mount's `caseSensitive` in `./index.js`, and `/metrics/`
+ * and `/metrics//` by that file's request-target gate. The gate is what covers
+ * the trailing slash, and it has to be: mounting strips the `/metrics` prefix
+ * and normalises what is left, so this Router is handed the identical path `/`
+ * whether the client asked for `/metrics` or `/metrics/` and has nothing left
+ * to be strict about.
+ *
+ * SO WHY SET THEM. Because the spellings this endpoint answers are a security
+ * property rather than a matter of taste -- it is unauthenticated, and the only
+ * control over it on a reachable deployment is an exact, case-sensitive
+ * reverse-proxy path rule (`server/README.md` section 8.4) that an extra
+ * served spelling walks straight past -- and because that property must not
+ * depend on this Router being the one place in the tree constructed loosely. A
+ * second route added here inherits the exactness instead of quietly widening
+ * the surface, and the guarantee survives a future edit to the gate.
  *
  * @type {import('express').Router}
  */
-const router = express.Router();
+const router = express.Router({ caseSensitive: true, strict: true });
 
 /**
  * Serve the current metric exposition document.

@@ -454,9 +454,30 @@ normally: `Drain started`, the `DRAIN_DELAY_MS` pause,
 | `GET /health/ready` | `200` JSON `{ status: "ready" }` | `503` JSON `{ status: "shutting_down" }` once a drain has begun |
 | `GET /metrics` | `200`, `text/plain; version=0.0.4`, Prometheus exposition format | — |
 | `HEAD` on any of the four `GET` paths above | that `GET`'s status and headers, with no body | that `GET`'s failure, with no body |
-| `POST /api/v1/echo` | `200` JSON `{ echo: <body>, requestId }` | `400` non-JSON media type, or an absent, empty, non-object or malformed body; `413` over `BODY_LIMIT`; `415` unsupported content encoding |
+| `POST /api/v1/echo` | `200` JSON `{ echo: <body>, requestId }` | `400` non-JSON media type, or an absent, empty, non-object, malformed or more-than-64-levels-deep body; `413` over `BODY_LIMIT`; `415` unsupported content encoding |
 | any unmatched path | — | `404` JSON `{ error: { status, message, requestId } }` |
 | any method other than `GET`, `HEAD` or `POST` | — | `404` JSON `{ error: { status, message, requestId } }`, `OPTIONS` included |
+
+**Each path above is matched exactly as written.** Routing is case-sensitive,
+and neither a trailing slash nor an empty path segment is accepted, so
+`/METRICS`, `/Metrics`, `/mEtRiCs`, `/metrics/`, `/metrics//`, `/HEALTH`,
+`/Health/Ready`, `/health/READY`, `/health/`, `/health/ready/`,
+`POST /API/V1/ECHO`, `POST /api/V1/echo`, `POST /api/v1/ECHO` and
+`POST /api/v1/echo/` all answer the same `404` envelope as `/nope`. Two
+clarifications, because both look like exceptions and neither is:
+
+- **A query string is not part of the path.** `GET /metrics?x=1` is
+  `GET /metrics` and is served normally; no route reads a query parameter.
+- **A client may rewrite your path before it is sent.** `curl` resolves dot
+  segments itself, so `curl http://localhost:3000/./metrics` requests
+  `/metrics` and succeeds. Sent literally, `/./metrics` is a `404` like any
+  other unmatched path.
+
+This exactness is the reason
+[section 8.4](#84-configure-the-reverse-proxy-and-tls)'s one-line proxy rule
+for `/metrics` is sufficient rather than approximate: the served set equals the
+table above, so a rule matching the documented spelling matches everything the
+service will answer.
 
 **`GET`, `HEAD` and `POST` reach the routes above; nothing else does.** A
 method gate ahead of the mounts admits those three, so every other method —
@@ -581,8 +602,8 @@ curl -s http://localhost:3000/metrics | head -6
 
 **`POST /api/v1/echo`** — echoes a JSON object or array back with the request
 id. The request must declare `Content-Type: application/json`, it must actually
-carry a payload, and the parsed body must be a JSON object — an empty one
-included — or an array.
+carry a payload, the parsed body must be a JSON object — an empty one
+included — or an array, and it must not nest more than **64 levels** deep.
 
 ```bash
 curl -s -X POST http://localhost:3000/api/v1/echo \
@@ -610,7 +631,7 @@ deliberately, and both are echoed back unchanged.
 
 Every rejection below is a `400` that names the fault it actually found, in
 the same `{ error: { status, message, requestId } }` envelope. The endpoint
-owns three messages, checked in this order:
+owns four messages, checked in this order:
 
 - **A media type that is not `application/json`** — a form-encoded body
   included — is `Request Content-Type must be application/json`. The media type
@@ -626,6 +647,25 @@ owns three messages, checked in this order:
   it is a body and is echoed.
 - **A parsed body that is neither an object nor an array** is `Request body
   must be a JSON object or array`.
+- **A body nested deeper than 64 levels** is `Request body must not nest
+  deeper than 64 levels`. Depth is counted in containers — the body itself is
+  level 1, a container inside it is level 2 — and the bound is inclusive, so a
+  body at exactly 64 levels is echoed and one at 65 is rejected. The reason is
+  the echo itself: writing the response serialises the body with
+  `JSON.stringify`, which recurses once per level, so an unbounded structure
+  would exhaust the stack **inside the response writer** and be reported as a
+  server fault — a `500`, an `error`-level exception record, and an increment
+  of the `5xx` bucket of [`/metrics`](#10-metrics-and-their-honest-limitation),
+  which is the signal for the service failing rather than for a caller sending
+  a body it will not echo. A 10 KB request can nest 5000 levels, so the size
+  limit is no protection at this depth and the bound is a separate check. 64 is
+  far below the depth at which serialisation actually breaks (measured between
+  4300 and 4400 on this build) because that figure is a property of the
+  available stack rather than a contract: it moves with the Node build and the
+  call depth the request arrives on, and a limit set near it would answer one
+  identical request differently from one day to the next. It is a fixed part of
+  the endpoint's contract, not an operator setting — the eight variables in
+  section 4 remain the whole of what a deployment configures.
 
 Two further rejections come from `express.json()` before the endpoint runs, so
 their message is the JSON parser's own and the error handler maps the parser's
@@ -645,12 +685,16 @@ keeps them out of the `5xx` bucket of
 [`/metrics`](#10-metrics-and-their-honest-limitation) — that bucket is the
 signal for the service failing, not for a caller sending a corrupt upload.
 
-Three in-memory checks run, in this order: the media type, then the raw
-payload's byte count, then the parsed shape. Emptiness is judged on that byte
-count — captured while the payload is still a buffer, which is the only moment
-it exists — rather than on the parsed value, which cannot tell an absent
-payload from a literal `{}`. Nothing re-reads the request stream, and no
-framing header is inspected on its own.
+Four in-memory checks run, in this order: the media type, then the raw
+payload's byte count for an empty payload, then the parsed shape, then the
+nesting depth. Emptiness is judged on that byte count — captured while the
+payload is still a buffer, which is the only moment it exists — rather than on
+the parsed value, which cannot tell an absent payload from a literal `{}`.
+Depth is checked last because it is the only one of the four that walks the
+parsed body; it walks it level by level rather than recursively, and stops at
+the first container past the bound, so rejecting a 5000-level payload costs
+about 65 steps. Nothing re-reads the request stream, and no framing header is
+inspected on its own.
 
 ```bash
 # 400 -- no payload framing at all, so the media type has nothing to describe
@@ -689,6 +733,19 @@ curl -s -X POST http://localhost:3000/api/v1/echo -H 'Content-Type: text/plain'
 curl -s -X POST http://localhost:3000/api/v1/echo \
   -H 'Content-Type: application/json' -d '{"a":'
 # {"error":{"status":400,"message":"Unexpected end of JSON input","requestId":"..."}}
+
+# 400 -- nested deeper than 64 levels. 5000 levels of array is 10 KB, well
+#        inside BODY_LIMIT, which is why depth is bounded on its own
+python3 -c "print('['*5000 + ']'*5000, end='')" \
+  | curl -s -X POST http://localhost:3000/api/v1/echo \
+      -H 'Content-Type: application/json' --data-binary @-
+# {"error":{"status":400,"message":"Request body must not nest deeper than 64 levels","requestId":"..."}}
+
+# 200 -- exactly 64 levels is accepted: the bound is inclusive
+python3 -c "print('['*64 + ']'*64, end='')" \
+  | curl -s -X POST http://localhost:3000/api/v1/echo \
+      -H 'Content-Type: application/json' --data-binary @-
+# {"echo":[[[...]]],"requestId":"..."}
 
 # 413 -- body over BODY_LIMIT
 head -c 200000 /dev/zero | tr '\0' 'x' \
@@ -791,6 +848,13 @@ limiting anywhere in this service — all four are out of scope for this
 change. That applies to `GET /metrics` as much as to anything else, which is
 why restricting it at the proxy is part of
 [section 8](#8-host-prerequisites--four-required-steps).
+
+Because the proxy rule is the only control there is, what the service serves
+has to match what that rule can express, and it does: routing is
+case-sensitive and slash-exact, so `/metrics` is the single spelling that
+reaches the handler. An exact, case-sensitive path rule — which is what every
+common proxy writes by default — therefore covers the endpoint completely,
+with no case-insensitive or trailing-slash variant left open behind it.
 
 ## 7. Operating under PM2
 
@@ -1637,7 +1701,31 @@ three must be handled:
   deployment. Do not build a configuration that assumes the proxy can drain
   individual workers.
 - **Restrict `GET /metrics` to internal callers.** It is unauthenticated like
-  every other route, and it exposes request counts and process figures.
+  every other route, and it exposes request counts and process figures. **One
+  exact-path rule is enough, and that is a property of the service rather than
+  an assumption about your proxy**: routing is case-sensitive and slash-exact,
+  so `/metrics` is the only spelling that reaches the handler — `/METRICS`,
+  `/Metrics` and `/metrics/` are `404`s from the application itself
+  ([section 6](#6-endpoint-reference)). Write the rule the way your proxy
+  writes exact paths:
+
+  ```nginx
+  # nginx — `=` is an exact, case-sensitive match
+  location = /metrics { allow 10.0.0.0/8; deny all; }
+  ```
+
+  ```haproxy
+  # HAProxy — `path` is an exact, case-sensitive match
+  http-request deny if { path /metrics } !{ src 10.0.0.0/8 }
+  ```
+
+  Do **not** relax it into a prefix or case-insensitive form
+  (`location /metrics`, `path_beg /metrics`, `~*`): a prefix rule also covers
+  paths the service does not serve, which hides a later route added under
+  `/metrics/…` behind a rule nobody re-reads. If the restriction is enforced
+  somewhere that only offers prefix matching, prefer denying `/metrics` and
+  everything beneath it over widening the match to spellings the application
+  already refuses.
 
 ## 9. Reading the logs
 
@@ -1808,6 +1896,15 @@ where a parser can read it. Do not turn it on.
   everything else at `info`. This one-record-per-request guarantee is what
   constrains `LOG_LEVEL` to `trace`, `debug` and `info`.
 
+  Under `req` it carries the id, the method, the **pathname only** (the query
+  string is dropped, never redacted), the trust-aware `ip` and `protocol` —
+  which is where `TRUST_PROXY` shows up in the logs — and an **allowlist of
+  request headers**: `host`, `user-agent`, `content-type`, `content-length`
+  and `accept-encoding` with their values, plus `authorization` and `cookie`
+  as `[Redacted]` markers recording only that the request carried a
+  credential. No other inbound header reaches a record, no `X-Forwarded-*`
+  value is written, and no response header is.
+
   Records store the level as pino's **number**, not its name, which is what
   `jq` filters on: `trace` 10, `debug` 20, `info` 30, `warn` 40, `error` 50,
   `fatal` 60.
@@ -1827,6 +1924,19 @@ is written, so neither ever appears in clear text in the logs. Separately, in
 production a 5xx response message is replaced by `Internal Server Error` while
 the real message stays in the log — so the log is where a 500 is diagnosed,
 and the response body deliberately says nothing useful to a client.
+
+**Every string in a record whose length a caller chooses is bounded**, and a
+value that was cut says so with an explicit `... (truncated)` suffix. The
+limits are the header values and the `ip` and `protocol` fields at **512**
+characters each, the pathname at **512** (the same bound the 404 message
+reflects back to the caller), and an error message at **1024** with its
+stack at 4096. So a truncated value in the log is this service's own policy
+at work — not a corrupted line, and not a client sending something malformed
+— and it is also why no single request can decide how large a log line the
+service writes: a 15 KB `User-Agent` costs 512 characters plus the marker in
+`out.log` rather than 15 KB. Credential material found *inside* one of those
+strings is replaced by `[REDACTED]`, spelled in capitals to distinguish it
+from pino's `[Redacted]` on a redacted header.
 
 ## 10. Metrics, and their honest limitation
 

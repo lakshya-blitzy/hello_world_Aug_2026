@@ -32,16 +32,29 @@ const express = require('express');
 /**
  * The router this module exports.
  *
- * A bare `express.Router()` carrying the one route registered below. It is
+ * An `express.Router()` carrying the one route registered below. It is
  * exported by direct assignment (`module.exports = router`) because
  * src/routes/index.js mounts it with
  * `router.use('/', require('./root.routes'))`, which needs a mountable Router
  * value -- not a wrapper object, not `{ router }`, and not a factory that has
  * to be invoked first. Any other export shape breaks that mount.
  *
+ * WHY THE TWO OPTIONS ARE HERE, on a Router whose only path is `/`. A Router
+ * matches by the options it is constructed with, and neither the application's
+ * `case sensitive routing` / `strict routing` settings nor the aggregator's own
+ * options reach it. `caseSensitive` cannot change how `/` matches, so it has
+ * no effect today. `strict: true` names one real spelling -- without it this
+ * route also answers `GET //`, which Express treats as a trailing-slash form
+ * of `/` and which the contract does not declare -- though that request is
+ * already refused a layer earlier by src/routes/index.js's request-target
+ * gate, so the effect here is defence in depth rather than the operative
+ * refusal. Both are set so that every Router in this tree is constructed the
+ * same way and a route added here later inherits the exactness instead of
+ * quietly widening the served surface.
+ *
  * @type {import('express').Router}
  */
-const router = express.Router();
+const router = express.Router({ caseSensitive: true, strict: true });
 
 /**
  * The root response body.

@@ -251,7 +251,7 @@ function createApp({ extraRouters = [] } = {}) {
   const app = express();
 
   /*
-   * APPLICATION SETTINGS -- all three declared before any middleware, so the
+   * APPLICATION SETTINGS -- all five declared before any middleware, so the
    * application's posture is established at construction and is the first
    * thing a reader of this file meets.
    */
@@ -304,6 +304,41 @@ function createApp({ extraRouters = [] } = {}) {
   // redundant -- this one closes the matching-validator path for the whole
   // application, that one closes the wildcard path for the fixed responses.
   app.set('etag', false);
+
+  // The two routing settings, declared as a pair because they answer one
+  // question: which SPELLINGS of a path this application serves. Express
+  // matches case-insensitively and tolerates a trailing slash by default, so
+  // `/METRICS`, `/Metrics` and `/metrics/` would each reach the handler
+  // registered for `/metrics`. This service's HTTP contract declares exact
+  // paths and answers everything else with the one 404 envelope, so the
+  // defaults widen the served surface past what is documented.
+  //
+  // WHY THAT IS A SECURITY PROPERTY HERE AND NOT A COSMETIC ONE. No route in
+  // this service authenticates its caller -- by design -- so the ONLY control
+  // over `GET /metrics` on a reachable deployment is the reverse-proxy rule
+  // that `server/README.md` section 8.4 requires an operator to write. Proxy
+  // path matching is case-sensitive and exact by default in every common
+  // implementation (nginx `location = /metrics`, HAProxy `path /metrics`, an
+  // ALB exact-path condition), so a rule written against the documented
+  // spelling would pass `/METRICS` and `/metrics/` straight through to the
+  // same handler while the operator believed the endpoint was restricted.
+  //
+  // WHAT THESE TWO SETTINGS DO **NOT** COVER -- read this before deleting
+  // anything elsewhere on the strength of them. Express reads them exactly
+  // once, when it builds the router the APPLICATION itself owns, so they
+  // govern only what is registered directly on `app`. Every `express.Router()`
+  // instance carries its own `caseSensitive` and `strict` options and ignores
+  // these settings entirely -- and this service registers its whole surface
+  // through routers. The four mount paths therefore take their strictness from
+  // `src/routes/index.js`, and each mount's own leaf paths from the route
+  // module that declares them; both halves are set there, and this pair covers
+  // neither. Verified by measurement rather than inference: with the routers
+  // left at their defaults, setting these two alone changes no response on any
+  // path. They are still correct and still belong here -- they are what makes
+  // a route added directly to `app` later inherit the same posture instead of
+  // silently reintroducing the wide surface.
+  app.set('case sensitive routing', true);
+  app.set('strict routing', true);
 
   /*
    * THE REQUEST PIPELINE -- EIGHT POSITIONS, IN THIS ORDER.

@@ -22,8 +22,13 @@ const MAX_ERROR_STATUS = 599;
  *   honours `err.status` as the response status.
  * - `src/middleware/not-found.js` constructs one with status 404 for a path the
  *   router did not match.
- * - `src/routes/api.routes.js` constructs one with status 400 when `POST /echo`
- *   rejects a request on media type or on body shape.
+ * - `src/routes/api.routes.js` constructs one with status 400 for each of its
+ *   four edge checks on `POST /echo`: the declared media type, an absent
+ *   payload, the parsed body's shape, and its nesting depth. The last of those
+ *   is why the enumeration is worth keeping current -- it is not a shape or a
+ *   header rejection but a bound on what the endpoint is willing to serialise
+ *   back, raised so that a structure `res.json()` could not stringify becomes
+ *   a named client error here rather than a masked 500 from the handler below.
  *
  * Throwing it from an `async` handler is equally valid: Express 5 forwards a
  * rejected promise to the four-arity error middleware automatically.

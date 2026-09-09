@@ -1662,3 +1662,34 @@ const logger = pino(options, target);
  * drop both, silently.
  */
 module.exports = logger;
+
+/*
+ * THE STRING BOUND, SHARED RATHER THAN COPIED.
+ *
+ * WHY THIS IS EXPORTED AT ALL. `safeText` is the record's whole string policy
+ * -- bound first, then scrub, with an explicit `... (truncated)` marker when
+ * characters were dropped -- and this module is no longer its only consumer.
+ * The access record assembled by src/middleware/request-context.js carries
+ * fields whose length is the CALLER's choice: the allowlisted request-header
+ * values, and the trust-aware `ip` and `protocol` that a proxy's
+ * `X-Forwarded-*` headers supply once `TRUST_PROXY` is on. Those are strings
+ * this module writes to the stream, so they answer to the same policy as an
+ * error message and a stack. Handing over the function keeps that ONE policy:
+ * a second implementation of "cut, then scrub, then mark" is how the two
+ * copies drift until one of them stops bounding anything.
+ *
+ * WHY A NAMED PROPERTY ON THE INSTANCE AND NOT `{ logger, safeText }`. The
+ * export above must stay the bare pino instance -- `src/server.js` calls
+ * `.flush()` on it and pino-http calls `.child()` -- so a wrapper object would
+ * break every existing consumer at load time to add one function. A property
+ * hung on the instance adds the second export without disturbing the first,
+ * which is exactly the shape `src/middleware/request-context.js` already uses
+ * to publish `serializePath` beside its middleware.
+ *
+ * The `MAX_*` constants stay PRIVATE on purpose. Each one bounds a field of
+ * this module's own records -- a message, a stack, a code, a type -- and a
+ * consumer choosing its own limit for its own field is the correct arrangement:
+ * what is shared is the mechanism, not a number that means something different
+ * in each record.
+ */
+module.exports.safeText = safeText;

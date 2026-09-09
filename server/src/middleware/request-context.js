@@ -17,6 +17,12 @@
  * to the 404 message it hands the caller. One implementation, so the record
  * and the response can never disagree about the same request.
  *
+ * The record's OTHER caller-sized fields -- the allowlisted header values and
+ * the trust-aware `ip` and `protocol` -- are bounded here too, but through
+ * `safeText` taken from `../lib/logger` rather than through a policy of this
+ * module's own: the size of a log line is one question, so it gets one answer.
+ * `MAX_LOGGED_HEADER_LENGTH` below carries the reasoning.
+ *
  * POSITION 1 OF 8, AND IT MUST BE FIRST. The pipeline `src/app.js` owns is:
  * 1 requestContext -> 2 helmet() -> 3 compression() -> 4 express.json() ->
  * 5 express.urlencoded() -> 6 router tree and `options.extraRouters` ->
@@ -45,6 +51,18 @@ const { randomUUID } = require('node:crypto');
 // The one root logger for the process, exported as the bare pino instance
 // rather than a facade, so `.child()` and the level methods stay intact.
 const logger = require('../lib/logger');
+
+/*
+ * The string policy of a record, taken from the logger rather than restated
+ * here: bound first, then scrub credential material, then mark the cut with an
+ * explicit `... (truncated)`. `../lib/logger` publishes it as a named property
+ * on the instance it exports -- the same shape this file uses for
+ * `serializePath` at its foot -- so the single `require` above yields both the
+ * logger and its bound, and no second module is pulled in to get one function.
+ * The access record's caller-sized fields apply it; see
+ * `MAX_LOGGED_HEADER_LENGTH` for what they are and why they need it.
+ */
+const { safeText } = logger;
 
 // The write side of the counter store, and only the write side. `render()` is
 // deliberately not imported: `../routes/metrics.routes.js` is the store's sole
@@ -97,6 +115,41 @@ const LEVEL_INFO = 'info';
 const MAX_LOGGED_PATH_LENGTH = 512;
 
 /**
+ * Longest header value -- and longest client address or scheme -- this service
+ * will write into an access record.
+ *
+ * WHY THESE FIELDS NEED A BOUND. Every one of them is a string the CALLER
+ * sizes. Node accepts roughly 16 KB of request headers before its parser
+ * answers `431`, so one unauthenticated request to any route can put about
+ * fifteen kilobytes of chosen content into a `User-Agent`, and a field written
+ * once per request with no ceiling is an unbounded log line: log-volume
+ * amplification wearing the shape of observability. Bounding it puts the size
+ * of a record back under this service's control, which is the same reason
+ * `MAX_LOGGED_PATH_LENGTH` above exists for the pathname.
+ *
+ * WHY 512 COSTS NOTHING IN REAL TRAFFIC. The value sits far above every header
+ * an ordinary client sends, so nothing legitimate is ever truncated: the most
+ * verbose browser and SDK `User-Agent` strings run to about 250 characters, a
+ * `Host` cannot exceed a 253-character name plus a port, and a `Content-Type`
+ * carrying charset and multipart-boundary parameters is around 120. What the
+ * bound removes is content nobody sends by accident.
+ *
+ * WHY IT IS A SEPARATE CONSTANT EVEN THOUGH IT HOLDS THE SAME NUMBER AS
+ * `MAX_LOGGED_PATH_LENGTH`. The two bound different fields with different
+ * multiplicity -- up to seven header values plus an address and a scheme in
+ * every record, against exactly one pathname -- so the reasons to change
+ * either differ, and one shared constant would make a future adjustment to one
+ * field silently move the other. It must also NOT be unified with the 512 that
+ * `./error-handler.js` keeps for its own field: that file belongs to another
+ * work unit at this checkpoint and is being edited concurrently, so reaching
+ * into it from here would collide with that edit. Where a bound genuinely has
+ * to be shared, what gets shared is a FUNCTION -- `serializePath` below,
+ * `safeText` above -- never a number copied across a module boundary.
+ * @type {number}
+ */
+const MAX_LOGGED_HEADER_LENGTH = 512;
+
+/**
  * The only request headers written to a record, and the list is a contract
  * rather than a convenience.
  *
@@ -119,6 +172,12 @@ const MAX_LOGGED_PATH_LENGTH = 512;
  *
  * Everything else is excluded on purpose, including `referer` (which routinely
  * carries another URL's query string) and `x-request-id` (already `req.id`).
+ *
+ * THE LIST GOVERNS WHICH VALUES MAY BE WRITTEN, NOT HOW LONG THEY MAY BE, so
+ * every value it admits is written BOUNDED at `MAX_LOGGED_HEADER_LENGTH` and
+ * carries an explicit `... (truncated)` marker when it was cut -- allowlisting
+ * a header name settles nothing about the size of the string a caller chooses
+ * to send under it.
  * @type {readonly string[]}
  */
 const LOGGED_HEADERS = Object.freeze([
@@ -295,7 +354,10 @@ function serializePath(url) {
  * @returns {{ id: *, method: *, path: string, ip: *, protocol: string,
  *   headers: Record<string, string> }} The permitted fields, and no others:
  *   the request id, the method, the bounded pathname, the trust-aware client
- *   address and scheme, and the allowlisted headers.
+ *   address and scheme, and the allowlisted headers -- with every field whose
+ *   length a caller chooses bounded and marked with `... (truncated)` when it
+ *   was cut, so the size of a record is this service's decision and not a
+ *   stranger's.
  */
 function serializeRequest(request) {
   // `raw` is the Express request, and it is what makes `ip` and `protocol`
@@ -321,7 +383,32 @@ function serializeRequest(request) {
       // while an absent one is `undefined` and is left out entirely rather
       // than written as null.
       if (typeof value === 'string') {
-        headers[name] = value;
+        // BOUNDED THROUGH THE LOGGER'S OWN POLICY, NOT COPIED IN RAW: a
+        // verbatim copy hands the size of the access record to the caller,
+        // which is the amplification `MAX_LOGGED_HEADER_LENGTH` describes.
+        // `safeText` is the same cut-then-scrub-then-mark function the logger
+        // applies to a message and a stack, so one policy governs every string
+        // this service writes instead of a second copy of it living here.
+        //
+        // APPLIED UNIFORMLY, INCLUDING TO `authorization` AND `cookie`, and
+        // that is deliberate rather than wasted work. pino's `redact` policy
+        // runs on the finished record, AFTER any serializer, so it replaces
+        // those two values wholesale and the rendered line still reads
+        // `"authorization":"[Redacted]"` no matter what this function
+        // returned -- while bounding first means a hostile 16 KB credential
+        // header costs a slice instead of three regular-expression scans
+        // before it is thrown away. Skipping the two would buy nothing and
+        // would put a special case in a loop that reads correctly without
+        // one.
+        //
+        // The scrub half of `safeText` applies here too, so a caller-supplied
+        // value carrying credential material of its own -- a `token=...` in a
+        // `User-Agent`, userinfo in a `Host` -- is written with that material
+        // removed. That is the same direction of over-scrubbing the logger's
+        // patterns already accept: losing part of a client-chosen string
+        // costs a reader nothing it needed, while writing a live credential
+        // costs far more.
+        headers[name] = safeText(value, MAX_LOGGED_HEADER_LENGTH);
       }
     }
   }
@@ -331,10 +418,19 @@ function serializeRequest(request) {
   // proxy this service has been told to trust declared otherwise -- and the
   // socket's own encryption state is what the answer would be if Express were
   // not in the path at all.
+  //
+  // BOUNDED FOR THE SAME REASON AS THE HEADERS, because behind a proxy it IS a
+  // header. Once `TRUST_PROXY` is `true` -- the documented posture for a
+  // service reachable through a proxy -- Express derives `req.protocol` from
+  // the left-most `X-Forwarded-Proto` entry and returns it verbatim, so the
+  // scheme becomes a caller-sized string on exactly the traffic the setting is
+  // turned on for. Bounding only the allowlisted headers would leave the
+  // identical amplification reachable through this field. The socket fallback
+  // needs no bound: `'https'` and `'http'` are this module's own literals.
   let protocol = 'http';
 
   if (typeof raw.protocol === 'string') {
-    protocol = raw.protocol;
+    protocol = safeText(raw.protocol, MAX_LOGGED_HEADER_LENGTH);
   } else if (
     raw.socket !== null &&
     typeof raw.socket === 'object' &&
@@ -351,7 +447,17 @@ function serializeRequest(request) {
     // `TRUST_PROXY` is `false`, and the left-most address the trusted proxy
     // chain vouches for once it is `true`. The socket address is the fallback
     // for a request that never passed through Express.
-    ip: typeof raw.ip === 'string' ? raw.ip : request.remoteAddress,
+    //
+    // BOUNDED ON THE SAME GROUND AS `protocol` ABOVE. Under `TRUST_PROXY=true`
+    // this value comes out of `X-Forwarded-For`, and Express returns the entry
+    // it selects as it found it -- so an address field can carry whatever a
+    // caller wrote in that header, at whatever length. The bound is on the
+    // trust-aware branch only: `request.remoteAddress` is the socket's own
+    // peer address, which the kernel supplies rather than the caller.
+    ip:
+      typeof raw.ip === 'string'
+        ? safeText(raw.ip, MAX_LOGGED_HEADER_LENGTH)
+        : request.remoteAddress,
     protocol,
     headers
   };
@@ -435,7 +541,10 @@ const httpLogger = pinoHttp({
  *     the level `customLogLevel()` chooses, carrying the request id, method,
  *     pathname, trust-aware client address and scheme, allowlisted headers,
  *     status and response time -- and no query string, no forwarded header and
- *     no response header;
+ *     no response header. Every one of those fields a caller sizes -- the
+ *     pathname, the header values, the address and the scheme -- is written
+ *     BOUNDED, with an explicit `... (truncated)` marker when it was cut, so
+ *     one request cannot choose how large a log line this service writes;
  *   * writes the request counters, of which it is the sole writer, pairing
  *     every accepted request with exactly one finish -- supplying the response
  *     status for the status-class bucket only when the response actually

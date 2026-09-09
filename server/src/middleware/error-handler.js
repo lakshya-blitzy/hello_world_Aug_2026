@@ -177,6 +177,27 @@ const MAX_CLIENT_ERROR_STATUS = 499;
  * wrong. They carry no row, so they fall through to `FALLBACK_STATUS` and are
  * recorded as the defects they are.
  *
+ * ALSO ABSENT, AND THE DECISION IS SETTLED RATHER THAN OVERLOOKED: a
+ * SERIALISATION `RangeError`. `res.json()` stringifies through
+ * `JSON.stringify`, which recurses once per nesting level, so a sufficiently
+ * nested value raises `RangeError: Maximum call stack size exceeded` from
+ * inside the response writer. It reaches this handler with no `err.type` and
+ * no `expose`, so it resolves to `FALLBACK_STATUS` and is masked -- and it
+ * must stay that way. There is no row for it and no `err instanceof
+ * RangeError` branch, for the same reason there is no `SyntaxError` branch:
+ * the error class says nothing about whose fault the failure was, and a stack
+ * overflow is far more often a runaway recursion in this service's own code
+ * than anything a caller sent. Mapping it to a 4xx here would tell a client it
+ * had made a mistake whenever this service overflowed its stack, and would
+ * silence the exception record that is the only account of a real defect.
+ * The client-reachable instance of it -- an echoed request body -- is
+ * therefore prevented at the edge instead: src/routes/api.routes.js rejects a
+ * body nested deeper than its `MAX_BODY_DEPTH` with a typed `HttpError(400)`
+ * before the value ever reaches `res.json()`, which is a deterministic bound
+ * on the request rather than a guess about the stack. Any serialisation
+ * overflow that still arrives here is a defect in this service, is masked, and
+ * is recorded as one.
+ *
  * @type {Readonly<Record<string, number>>}
  */
 const PARSER_STATUS_BY_TYPE = Object.freeze({

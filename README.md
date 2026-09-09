@@ -34,7 +34,10 @@ Before the service is reachable from another host, read the host
 prerequisites in section 8 of the runbook,
 [`server/README.md`](server/README.md): TLS is terminated by a reverse proxy
 in front of this plain-HTTP listener, `TRUST_PROXY` is set only when that
-topology justifies it, and `GET /metrics` is restricted to internal callers.
+topology justifies it, and `GET /metrics` is restricted to internal callers —
+one exact-path rule does that completely, because the service serves each
+documented path in exactly one spelling and answers every case or
+trailing-slash variant with a `404`.
 
 Both forms run in the foreground, and `Ctrl+C` stops them cleanly because the
 terminal signals the whole process group, so the drain reaches the `node`

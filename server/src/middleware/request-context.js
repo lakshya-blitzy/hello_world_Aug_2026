@@ -349,7 +349,9 @@ function serializeRequest(request) {
  *
  * @param {object} response The response as pino's default serializer reduced
  *   it; only `statusCode` is read.
- * @returns {{ statusCode: * }} The status the response completed with.
+ * @returns {{ statusCode: * }} The status the response carried when it closed
+ *   -- `null` for a connection destroyed before any status was sent, which is
+ *   the same outcome the counter store is told about as an abort.
  */
 function serializeResponse(response) {
   return { statusCode: response.statusCode };
@@ -415,8 +417,9 @@ const httpLogger = pinoHttp({
  *     status and response time -- and no query string, no forwarded header and
  *     no response header;
  *   * writes the request counters, of which it is the sole writer, pairing
- *     every accepted request with exactly one finish carrying the status the
- *     response held when it closed.
+ *     every accepted request with exactly one finish -- supplying the response
+ *     status for the status-class bucket only when the response actually
+ *     completed, so an aborted connection is not tallied as a success.
  *
  * It never sends a response, never inspects a route and always delegates.
  *
@@ -477,9 +480,14 @@ function requestContext(req, res, next) {
 
     // Exactly one end for every start, including for a request the client
     // aborts: Node emits `'close'` once whether the response completed or the
-    // connection was destroyed first. The status passed is `res.statusCode`,
-    // the status the response carried at the moment it closed.
-    recordRequestEnd(res.statusCode);
+    // connection was destroyed first. `res.writableFinished` is what
+    // distinguishes the two -- it turns true only once the response has been
+    // flushed to the socket, which is the "completed" the status-class family
+    // counts. A response that did not finish is reported as `undefined`, the
+    // store's abort signal: it lowers the in-flight gauge and tallies no
+    // status class. Passing `res.statusCode` unconditionally would file
+    // abandoned requests under Node's untouched default of 200.
+    recordRequestEnd(res.writableFinished ? res.statusCode : undefined);
   });
 
   return httpLogger(req, res, next);

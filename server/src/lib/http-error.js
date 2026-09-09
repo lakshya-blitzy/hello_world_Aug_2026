@@ -83,11 +83,11 @@ class HttpError extends Error {
       this.details = details;
     }
 
-    // Passing the constructor as the second argument captures the stack with
-    // this constructor's own frame omitted, so `err.stack`'s first frame is the
-    // call site that raised the error rather than this module. That is what
-    // makes an exception record point at the code that made the decision.
-    Error.captureStackTrace(this, HttpError);
+    // `Error.captureStackTrace(this, HttpError)` IS DELIBERATELY ABSENT, and it
+    // has been added and removed twice already. `super(message)` captures the
+    // stack, and V8 omits error-subclass constructor frames, so frame 1 is the
+    // raising call site with or without it -- measured identical on the pinned
+    // Node 24.20.0 in three call shapes, at twice the per-error cost.
   }
 }
 

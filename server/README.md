@@ -224,10 +224,13 @@ repository root `.gitignore` and **must never be committed**.
 started with no `.env` at all runs on port 3000 in `development` at log level
 `info` with `trust proxy` disabled. But anything you *do* supply must be
 valid, and **all failures are reported together** — an operator with three bad
-values sees three, not just the first. Invalid configuration prevents the
-listener from binding at all; the process exits non-zero before serving
-anything. See [section 11](#11-troubleshooting) for what that output looks
-like.
+values sees three, not just the first. **A blank assignment counts as
+supplied**: `KEY=`, or a value that is only whitespace, is rejected rather
+than defaulted — `<NAME> was supplied but is empty; blanking a value is not
+the same as omitting it` — so to take a default, delete the line or leave the
+key out. Invalid configuration prevents the listener from binding at all; the
+process exits non-zero before serving anything. See
+[section 11](#11-troubleshooting) for what that output looks like.
 
 ### The four values that carry a decision
 
@@ -341,6 +344,19 @@ is deliberate and is explained in [section 7](#7-operating-under-pm2).
 | `GET /metrics` | `200`, `text/plain; version=0.0.4`, Prometheus exposition format | — |
 | `POST /api/v1/echo` | `200` JSON `{ echo: <body>, requestId }` | `400` non-JSON media type, or an absent, empty, non-object or malformed body; `413` over `BODY_LIMIT`; `415` unsupported content encoding |
 | any unmatched path | — | `404` JSON `{ error: { status, message, requestId } }` |
+| any method other than `GET` or `POST` | — | `404` JSON `{ error: { status, message, requestId } }`, `HEAD` and `OPTIONS` included |
+
+**Only `GET` and `POST` reach the routes above.** A method gate ahead of the
+mounts admits those two and nothing else, so every other method — `HEAD` and
+`OPTIONS` included — falls through to the same terminal `404` envelope, whose
+message names the method it rejected (`Cannot OPTIONS /health`); on a `HEAD`
+the status is the whole answer, because HTTP allows that response no body.
+`HEAD` on a `GET` route is therefore **not** served, even though Express would
+ordinarily answer it from the `GET` route: **configure a health check or
+uptime monitor to probe with `GET`, not `HEAD`**, or every probe reads back as
+a hard failure. The gate writes no status, body or header of its own, so no
+`405` and no `Allow` header is produced on any path — `OPTIONS` is a plain
+`404` rather than the `200` with `Allow` Express would otherwise send.
 
 Every route is served on `HOST:PORT`. The examples below assume the default
 `localhost:3000`.
@@ -575,6 +591,14 @@ real business routes, and nothing else in the service depends on it.
   `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN` and
   `Referrer-Policy: no-referrer`.
 - **`X-Powered-By` is absent** — the setting is disabled explicitly.
+- **No response carries an `ETag`.** Validator generation is disabled for the
+  whole application, so no response — including any route added later — can be
+  revalidated against this service with a conditional request.
+- **Both probe responses carry `Cache-Control: no-store`.** `GET /health` and
+  `GET /health/ready` forbid storage outright, because a stored
+  `{"status":"ready"}` replayed by an intermediary during a drain would report
+  a worker as available exactly when it is being withdrawn. No other response
+  sets a cache directive of its own.
 - **Responses above the compression threshold are gzipped** when the client
   sends `Accept-Encoding: gzip`. `GET /` and `GET /health` are both well below
   the threshold and are therefore not compressed in practice; a large
@@ -1598,11 +1622,22 @@ PORT=abc npm start
 # {"level":"fatal","time":1767225600000,"pid":1234,
 #  "code":"ERR_CONFIG_VALIDATION",
 #  "msg":"Configuration validation failed; the listener was never bound",
-#  "err":"Invalid environment configuration: PORT must be a whole number (received \"abc\") ...",
-#  "failures":["PORT must be a whole number (received \"abc\")"]}
+#  "err":"Invalid environment configuration: PORT must be a whole number
+#   matching ^-?\\d+$ -- digits, optionally preceded by a minus sign, and
+#   nothing else (3 characters supplied). Every variable is optional ...",
+#  "failures":["PORT must be a whole number matching ^-?\\d+$ -- digits,
+#   optionally preceded by a minus sign, and nothing else (3 characters
+#   supplied)"]}
 echo $?
 # 1
 ```
+
+Each entry names the variable and states the rule it broke, but **never echoes
+the value** — where the length is informative it reports a character count
+instead, and a blank simply reports that the variable is empty. That is
+deliberate: a variable can hold a credential, and this record goes to stderr
+where PM2 files it, so echoing the value would put it in a log file. Compare
+the named variable against your own `server/.env`.
 
 **The service writes nothing to stdout on this path** — that one record, on
 stderr, is the whole of its output. The stdout lines are npm's lifecycle
@@ -1611,15 +1646,17 @@ silenced; they belong to npm, not to the service. Where the two streams must
 be cleanly separated, use `npm --silent start`, which leaves stdout empty, or
 run `node src/server.js` directly.
 
-`failures` holds one entry per invalid variable — three bad values produce
-three entries. The redirection below sends stdout to `/dev/null`, so the
-banner is discarded and `jq` reads only the record:
+`failures` holds one entry per invalid variable — four bad values produce four
+entries, and a variable supplied blank is one of them. The redirection below
+sends stdout to `/dev/null`, so the banner is discarded and `jq` reads only
+the record:
 
 ```bash
-PORT=abc LOG_LEVEL=warn TRUST_PROXY=maybe npm start 2>&1 >/dev/null | jq -r '.failures[]'
-# PORT must be a whole number (received "abc")
-# LOG_LEVEL must be one of trace, debug, info (received "warn")
-# TRUST_PROXY must be exactly "true" or "false" (received "maybe")
+PORT=abc HOST= LOG_LEVEL=warn TRUST_PROXY=maybe npm start 2>&1 >/dev/null | jq -r '.failures[]'
+# PORT must be a whole number matching ^-?\d+$ -- digits, optionally preceded by a minus sign, and nothing else (3 characters supplied)
+# HOST was supplied but is empty; blanking a value is not the same as omitting it
+# LOG_LEVEL must be exactly one of trace, debug, info, matched case-sensitively (4 characters supplied)
+# TRUST_PROXY must be exactly "true" or "false", lower-case (5 characters supplied)
 ```
 
 A validation failure is deliberately not a stack trace. It happens before any

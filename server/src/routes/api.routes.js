@@ -135,14 +135,14 @@ router.post('/echo', (req, res, next) => {
     );
   }
 
-  // AN EMPTY OBJECT IS NOT A BODY. express.json() special-cases an empty
-  // payload and yields `{}` for it rather than raising a parse error, so by
-  // the time execution reaches here a request that carried no bytes and a
-  // request that carried the two bytes `{}` are the same value -- and the
-  // contract requires 400 for an empty body. Rejecting a zero-key plain object
-  // is therefore what makes that outcome real. An empty ARRAY is different in
-  // kind: it can only be sent deliberately, never synthesised from an absent
-  // payload, so `[]` is a valid body and is echoed back unchanged.
+  // AN EMPTY OBJECT IS NOT A BODY. Plan sections 0.5.3 and 0.9 both require
+  // 400 for an empty body, and 0.5.1 pins position 4 as exactly
+  // `express.json({ limit })`: with no `verify` hook the parser yields `{}`
+  // for an empty payload, so no bytes and the two bytes `{}` are one value
+  // here. Rejecting a zero-key plain object is the only way to satisfy 0.9
+  // under those pinned options; a `verify` byte-count hook was considered and
+  // declined as a 0.5.1 deviation. An empty ARRAY is different in kind: only
+  // ever sent deliberately, never synthesised, so `[]` is echoed unchanged.
   if (!Array.isArray(req.body) && Object.keys(req.body).length === 0) {
     return next(new HttpError(400, 'Request body is required'));
   }

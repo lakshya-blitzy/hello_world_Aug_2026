@@ -187,12 +187,14 @@ function recordRequestStart() {
  *
  * Sole permitted caller: `../middleware/request-context.js`, on completion.
  *
- * @param {number} statusCode Status code of the response, normally 100-599.
- *   Required: it is the value that decides which of the five buckets moves,
- *   and `http_requests_by_status_class_total` counts responses by the status
- *   they completed with. A value that maps to none of the five classes lowers
- *   the gauge and tallies nothing, which is what keeps the label set fixed at
- *   five series.
+ * @param {number|undefined} statusCode Status code of the response, normally
+ *   100-599 -- and `undefined` when the response did NOT complete, per the
+ *   abort clause of the pairing contract above. `undefined` lowers the
+ *   in-flight gauge and tallies no bucket, which is what
+ *   `http_requests_by_status_class_total` counting *completed* responses
+ *   means. A number outside the five known classes also lowers the gauge
+ *   without tallying, but that path is a caller defect rather than an expected
+ *   outcome; either way the fixed five-series label set is preserved.
  * @returns {void}
  */
 function recordRequestEnd(statusCode) {
@@ -201,6 +203,16 @@ function recordRequestEnd(statusCode) {
   // independent of the status is what makes the pairing contract above
   // satisfiable for a request that ended without a countable status.
   inFlight -= 1;
+
+  // The abort path, tested explicitly rather than left to fall through
+  // `statusClassKey()`'s defect guard. Both would skip the increment, but only
+  // an explicit test says an absent status is EXPECTED here -- a reader who
+  // saw an abort land in a branch whose own documentation calls it a path
+  // ordinary traffic never takes would take that guard for load-bearing and
+  // try to fix the abort into a bucket.
+  if (statusCode === undefined) {
+    return;
+  }
 
   const key = statusClassKey(statusCode);
 

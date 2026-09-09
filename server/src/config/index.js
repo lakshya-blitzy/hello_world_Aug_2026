@@ -9,21 +9,21 @@
  * failures into one thrown error, and exports one frozen configuration
  * object. Every other module -- `src/server.js`, `src/app.js`,
  * `src/lib/logger.js`, `src/middleware/error-handler.js`,
- * `src/routes/health.routes.js`, `src/routes/metrics.routes.js` -- obtains
- * environment-derived values by requiring this file and reading that object,
- * never by touching `process.env` itself.
+ * `src/routes/health.routes.js` -- obtains environment-derived values by
+ * requiring this file and reading that object, never by touching
+ * `process.env` itself.
  *
  * THE CONTRACT IT ENFORCES IS THE SPECIFIED ONE, NOT ONE OF THIS MODULE'S
  * MAKING. Nothing is mandatory: a variable that is absent takes the
- * documented default recorded in `server/.env.example`, and a variable
- * supplied empty or whitespace-only is absent for this purpose -- `PORT=`
- * says "I did not set this", so it defaults exactly as a deleted line would.
- * Anything supplied WITH CONTENT must be valid, and every failure is reported
- * together rather than one per restart. The specified rule for `HOST`,
- * `non-empty string`, therefore holds by construction rather than by a
- * separate check: readRaw() trims and reports nothing back, so the exported
- * value is either a trimmed non-empty string or the documented default, never
- * the empty string a listener could not bind.
+ * documented default recorded in `server/.env.example`. Anything supplied
+ * must be valid -- including a variable supplied empty, which is present in
+ * the environment holding a value no validator accepts and is therefore
+ * reported rather than defaulted. Every failure is reported together rather
+ * than one per restart. The specified rule for `HOST`, `non-empty string`,
+ * lives in readRaw(), the single place a blank can be detected: what it
+ * returns is a trimmed non-empty string, so the exported value is either that
+ * or the documented default, never the empty string a listener could not
+ * bind.
  *
  * THE NAMES IT CONSULTS ARE EXACTLY THE EIGHT OPERATOR VARIABLES PLUS
  * `NODE_APP_INSTANCE`. It reads no other environment name, writes none, and
@@ -97,14 +97,10 @@ const dotenv = require('dotenv');
  * A constant, deliberately -- not an environment read, and not a runtime read
  * of `package.json`. The same string is declared independently in
  * `server/package.json` (`name`) and `server/ecosystem.config.js` (`name`),
- * and it reaches its three consumers through *this* object rather than through
- * a manifest read: the logger's base fields, the `GET /health` response, and
- * the `service` label on every `/metrics` sample. The metrics path is indirect
- * on purpose -- `src/routes/metrics.routes.js` reads this value and passes it
- * to `src/lib/metrics.js`'s `render()`, because that counter store is a
- * dependency-free leaf and must never `require('../config')` itself. All
- * three declarations must therefore carry the same value, or `pm2 status`, the
- * logs and the health response will disagree about what is running.
+ * and it reaches its two consumers through *this* object rather than through
+ * a manifest read: the logger's base fields and the `GET /health` response.
+ * All three declarations must therefore carry the same value, or `pm2 status`,
+ * the logs and the health response will disagree about what is running.
  *
  * @type {string}
  */
@@ -574,43 +570,43 @@ function describeDiagnostic(diagnostic) {
 }
 
 /**
- * Reads one environment variable, trimmed, treating "no value supplied" as one
- * condition however it arose.
+ * Reads one environment variable, trimmed, distinguishing a variable that was
+ * never set from one that was set to nothing.
  *
  * This is the single point at which this codebase touches `process.env` for a
  * configuration variable; every reader below goes through it, and no other
  * module has any business calling anything like it.
  *
- * WHAT ABSENCE MEANS HERE, AND WHY A BLANK COUNTS AS ONE. An unset name and a
- * name holding nothing but whitespace are reported identically -- as
- * `undefined`, so the caller applies the documented default. `PORT=` is an
- * operator saying "I did not set this", and it is also what a machine produces
- * when a template placeholder goes unexpanded or a substitution resolves
- * against an unset variable; reading that as a value that satisfies no
- * validator would refuse a start-up over a line whose plain meaning is
- * emptiness. To take a default, an operator may delete the assignment or leave
- * it blank; both do the same thing.
+ * WHY A SUPPLIED BLANK IS A FAILURE RATHER THAN AN ABSENCE. The rule is that
+ * nothing is mandatory but ANYTHING SUPPLIED MUST BE VALID, and `PORT=` is
+ * supplied: the name is present in the environment, holding a value that
+ * satisfies no validator. Reading it as absence would make every per-variable
+ * rule skippable by blanking the value instead of correcting it -- and a blank
+ * is what a machine produces when a template placeholder goes unexpanded or a
+ * substitution resolves against an unset variable, so the silent default would
+ * be a port nobody chose, or the all-interfaces `HOST` where a deployment
+ * meant loopback, both of which look like a healthy start-up. An operator who
+ * wants the default deletes the assignment; that is what absence means and it
+ * is the one line in `server/.env.example` to remove.
  *
- * The consequence worth knowing is that a blank is not announced. A deployment
- * that intends to narrow a setting must write the value: `HOST=` accepts the
- * all-interfaces default rather than reporting that the intended address never
- * arrived. `server/.env.example` states this beside the keys an operator edits.
- *
- * WHY THIS IS ALSO WHERE `HOST`'S NON-EMPTY RULE IS DISCHARGED. Trimming and
- * folding a blank into absence is the guard: everything this function returns
- * is a trimmed, non-empty string, so `config.host` is either that or the
- * default and can never be the empty string a listener could not bind. A
- * separate emptiness check in a per-variable reader would be unreachable code
- * asserting what this contract already guarantees.
+ * WHY THIS IS ALSO WHERE `HOST`'S NON-EMPTY RULE LIVES. A blank can only be
+ * seen here, so this is the only place that rule can be enforced; everything
+ * this function returns is a trimmed, non-empty string, so `config.host` is
+ * either that or the documented default and can never be the empty string a
+ * listener could not bind.
  *
  * Trimming has a second effect worth stating: stray whitespace around an
- * otherwise valid value in a `.env` line can never turn it into a failure.
+ * otherwise valid value in a `.env` line can never turn it into a failure --
+ * and a value that is nothing BUT whitespace is a blank, handled as above.
  *
  * @param {string} name The environment variable name, e.g. `'PORT'`.
+ * @param {string[]} failures Accumulator that a failure message is pushed onto
+ *                            when the variable is supplied but blank.
  * @returns {string|undefined} The trimmed, non-empty value; `undefined` when
- *                             the variable is unset or holds only whitespace.
+ *                             the variable is unset, or when a failure was
+ *                             recorded.
  */
-function readRaw(name) {
+function readRaw(name, failures) {
   const raw = process.env[name];
 
   if (typeof raw !== 'string') {
@@ -619,7 +615,20 @@ function readRaw(name) {
 
   const trimmed = raw.trim();
 
-  return trimmed.length === 0 ? undefined : trimmed;
+  if (trimmed.length === 0) {
+    // Only the variable-specific fact belongs here. The aggregated message
+    // this is folded into already tells the operator that every variable is
+    // optional and that removing the assignment is the fix, so repeating it
+    // per failure would say it three times for three blank variables.
+    failures.push(
+      `${name} was supplied but is empty; blanking a value is not the same ` +
+        'as omitting it'
+    );
+
+    return undefined;
+  }
+
+  return trimmed;
 }
 
 /**
@@ -639,7 +648,7 @@ function readRaw(name) {
  *                             recorded.
  */
 function readInteger(name, failures) {
-  const raw = readRaw(name);
+  const raw = readRaw(name, failures);
 
   if (raw === undefined) {
     return undefined;
@@ -770,7 +779,7 @@ function readNonNegativeInteger(name, failures) {
  *                             recorded.
  */
 function readEnum(name, allowed, failures) {
-  const raw = readRaw(name);
+  const raw = readRaw(name, failures);
 
   if (raw === undefined) {
     return undefined;
@@ -819,7 +828,7 @@ function readEnum(name, allowed, failures) {
  *                              recorded.
  */
 function readBoolean(name, failures) {
-  const raw = readRaw(name);
+  const raw = readRaw(name, failures);
 
   if (raw === undefined) {
     return undefined;
@@ -896,7 +905,7 @@ function resolveBodyLimitBytes(raw) {
  *                             was recorded.
  */
 function readBodyLimit(name, failures) {
-  const raw = readRaw(name);
+  const raw = readRaw(name, failures);
 
   if (raw === undefined) {
     return undefined;
@@ -1003,13 +1012,15 @@ function readBodyLimit(name, failures) {
  *
  *   * NOTHING IS MANDATORY. Every variable has a default, so a process with no
  *     `.env` file and an empty environment is fully configured and starts
- *     cleanly. Absence is what selects a documented default, and a variable
- *     supplied empty or whitespace-only is absence -- see readRaw().
- *   * ANYTHING SUPPLIED WITH CONTENT MUST BE VALID, AND ALL FAILURES ARE
- *     REPORTED TOGETHER. Each reader records its own problem and returns
- *     `undefined` instead of throwing, so validation always runs to
- *     completion. An operator who has mistyped three variables is told about
- *     three, not asked to fix one and restart to discover the next.
+ *     cleanly. Absence -- a deleted assignment or an unset name -- is what
+ *     selects a documented default.
+ *   * ANYTHING SUPPLIED MUST BE VALID, AND ALL FAILURES ARE REPORTED TOGETHER.
+ *     Each reader records its own problem and returns `undefined` instead of
+ *     throwing, so validation always runs to completion. An operator who has
+ *     mistyped three variables is told about three, not asked to fix one and
+ *     restart to discover the next. "Supplied" includes supplied empty: a
+ *     name present in the environment holding a blank value is a failure, not
+ *     an absence -- see readRaw().
  *
  * `??` is used throughout rather than `||`, and the distinction is not
  * stylistic: `drainDelayMs` may legitimately be 0 and `trustProxy` may
@@ -1040,14 +1051,15 @@ function loadConfiguration() {
   const port = readBoundedInteger('PORT', PORT_MIN, PORT_MAX, failures) ??
     DEFAULTS.port;
 
-  // `HOST`'s rule in the configuration contract is "non-empty string", and it
-  // is discharged by readRaw() plus this fallback rather than by a validator
-  // of its own: readRaw() returns a trimmed non-empty string or `undefined`,
-  // and `undefined` becomes the documented default here. `config.host` is
-  // therefore never the empty string, and a listener is never asked to bind
-  // nothing. A separate non-empty-string reader would add an unreachable
-  // check, which is why none exists.
-  const host = readRaw('HOST') ?? DEFAULTS.host;
+  // `HOST`'s rule in the configuration contract is "non-empty string", and
+  // readRaw() is where that rule is enforced: it trims, and it records a
+  // failure for a value that is empty or whitespace-only rather than falling
+  // back to the default. Everything it returns is therefore already a trimmed,
+  // non-empty string, so `config.host` is never the empty string and a
+  // listener is never asked to bind nothing. A second emptiness check here
+  // would be unreachable, which is why no separate non-empty-string reader
+  // exists for it.
+  const host = readRaw('HOST', failures) ?? DEFAULTS.host;
 
   const nodeEnv = readEnum('NODE_ENV', NODE_ENV_VALUES, failures) ??
     DEFAULTS.nodeEnv;
@@ -1116,14 +1128,10 @@ function loadConfiguration() {
   //
   // WHY IT DEFAULTS TO 0 RATHER THAN BEING OMITTED. A directly launched
   // process reports `instance: 0` rather than dropping the field, so the
-  // `GET /health` response, every log line and the `instance` label on every
-  // `/metrics` sample have the SAME SHAPE whether or not PM2 launched the
-  // process. A consumer parsing those never has to handle an absent field, and
-  // a query written against production logs works unchanged against a
-  // developer's local run. The label reaches the exposition as an ARGUMENT,
-  // not an import: `src/routes/metrics.routes.js` passes this value into
-  // `src/lib/metrics.js`'s `render()`, which stays a dependency-free leaf and
-  // must never `require('../config')`.
+  // `GET /health` response and every log line have the SAME SHAPE whether or
+  // not PM2 launched the process. A consumer parsing those never has to handle
+  // an absent field, and a query written against production logs works
+  // unchanged against a developer's local run.
   const instance = readNonNegativeInteger('NODE_APP_INSTANCE', failures) ??
     DEFAULTS.instance;
 

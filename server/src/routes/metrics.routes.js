@@ -36,6 +36,26 @@
  * only -- never request content, and no configuration-derived value.
  * Restricting `/metrics` on a public deployment belongs at the reverse proxy,
  * which is documented in `server/README.md` rather than implemented here.
+ *
+ * `HEAD /metrics` IS ANSWERED FROM THE `GET` ROUTE BELOW, and that is the
+ * point of not declaring a `HEAD` handler here. The router package resolves
+ * `HEAD` against this route because none exists, so a `HEAD` caller receives
+ * `200` and the exact `text/plain; version=0.0.4` content type, with Node
+ * suppressing the exposition body. That is the only way to read this
+ * endpoint's media type without downloading the whole document -- `curl -I`
+ * against it is a legitimate operator check, and it works. Unlike the root and
+ * probe routes, this handler sets no `Content-Length` (`render()`'s output is
+ * framed by Node, which uses chunked encoding for a `GET`), so a `HEAD`
+ * answer carries the status and the content type and no framing header at all;
+ * RFC 9110 permits omitting a header whose value is determined only while
+ * generating the content, so nothing is missing from that response.
+ * `render()` is NOT called any differently for a `HEAD`: it runs, its result is
+ * handed to `res.end()`, and Node discards the bytes -- so a `HEAD` scrape
+ * costs one render whose output nobody reads. It mutates nothing either way;
+ * `render()` is a pure read, and a `HEAD` request is counted by the
+ * request-context middleware exactly as the equivalent `GET` is, since that
+ * middleware is the store's only writer and runs at pipeline position 1,
+ * before the method ever reaches this route.
  */
 'use strict';
 

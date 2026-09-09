@@ -13,14 +13,22 @@
  * `src/config/index.js`, but PM2 reads this file in the CLI's own process
  * before any application code runs, so `require('./src/config')` would
  * centralise nothing -- it would run the service's environment validation
- * inside the supervisor. The one value spanning both worlds, the shutdown
- * budget, is a paired obligation instead: see `kill_timeout` below.
+ * inside the supervisor. The values spanning both worlds are paired
+ * obligations instead, and there are TWO of them: the SHUTDOWN budget
+ * (`kill_timeout` here against the `SHUTDOWN_TIMEOUT_MS` ceiling the
+ * configuration validator enforces) and the MEMORY budget (`node_args` here
+ * against `max_memory_restart` here). Nothing checks either relationship at
+ * run time, which is why each is stated beside its fields below.
  *
  * COMMONJS, NOT ESM: PM2 loads this file with `require`, which is why
  * `package.json` declares no `"type": "module"`.
  *
- * `time`, `instances` and `kill_timeout` each fail SILENTLY if changed, so the
- * reason each holds its value is stated beside the field.
+ * `time`, `instances`, `kill_timeout` and the `node_args` heap figure each
+ * fail SILENTLY if changed, so the reason each holds its value is stated
+ * beside the field -- including the newest of them: a heap figure raised
+ * above `max_memory_restart` leaves nothing bounding V8's growth below the
+ * restart threshold, which silently converts that threshold from a safety net
+ * into an operational trigger that restarts healthy workers under load.
  *
  * @module ecosystem.config
  */
@@ -117,7 +125,47 @@ module.exports = {
       kill_timeout: 12000,
 
       /*
-       * A POLLED RESTART THRESHOLD FOR A LEAKING WORKER -- NOT A HARD CEILING.
+       * THE HEAP HALF OF ONE MEMORY BUDGET, WHOSE OTHER HALF IS
+       * `max_memory_restart` DIRECTLY BELOW. Without this flag V8 sizes its
+       * heap from HOST memory: 4288 MiB of `heap_size_limit` on the host these
+       * figures were measured on, 16.7x the 256 MiB restart threshold. V8
+       * therefore has no reason to collect anywhere near the threshold, and
+       * whatever headroom the service keeps under load is a property of how
+       * much memory the host happens to have rather than of anything declared
+       * here. Declaring the figure is what makes the margin a decision.
+       *
+       * 192 MB of old space yields a `heap_size_limit` of 384 MiB on Node
+       * 24.20.0 -- old space plus the other spaces -- and under sustained
+       * large-body `POST /api/v1/echo` load a worker then holds a FLAT plateau
+       * at roughly 134 MiB on PM2's own measurement source (52% of the
+       * threshold) and 155 MiB resident (61%), against roughly 168 MiB and
+       * 240 MiB before, the latter being 93.7% of the threshold. PM2 compares
+       * its OWN figure against the threshold, so both sources are quoted:
+       * `README.md` section 7 carries the measurements and their provenance.
+       *
+       * IT DOES NOT HARD-BOUND RESIDENT MEMORY, which is heap plus external
+       * buffers plus native allocation: this bounds the dominant term, not the
+       * total, so `max_memory_restart` stays the safety net and an OS-level
+       * limit stays the only figure that cannot be overshot. It also binds
+       * ONLY the workers PM2 launches -- PM2 7.0.4 forwards `node_args` to
+       * cluster workers as `cluster.settings.execArgv`, while a direct
+       * `npm start` or `npm run dev` reads no descriptor at all and gets the
+       * host-derived heap.
+       *
+       * A PAIRED OBLIGATION, exactly like `kill_timeout` above and the
+       * `SHUTDOWN_TIMEOUT_MS` ceiling: move the two fields together, and keep
+       * the OLD-SPACE FIGURE IN THIS FLAG -- the 192, not the 384 MiB
+       * `heap_size_limit` V8 derives from it -- below the restart threshold
+       * declared next. Neither number is the one PM2 compares: PM2 samples
+       * RESIDENT memory, and what this flag does is bound the largest part of
+       * it. Neither Node nor PM2 checks the relationship, so an inversion
+       * goes undetected.
+       */
+      node_args: ['--max-old-space-size=192'],
+
+      /*
+       * A POLLED RESTART THRESHOLD FOR A LEAKING WORKER -- NOT A HARD CEILING,
+       * AND THE OTHER HALF OF THE MEMORY BUDGET `node_args` ABOVE OPENS.
        * PM2 samples resident memory on its worker interval (30 s by default)
        * and restarts at the first sample above this figure, which turns a slow
        * leak into a RECORDED restart in `pm2 status`. It does not bound
@@ -125,6 +173,12 @@ module.exports = {
        * between samples, and the kernel's OOM killer can arrive first. A limit
        * that cannot be overshot is a host concern -- cgroup, systemd
        * `MemoryMax=`, container limit -- and belongs to `README.md`.
+       *
+       * The division of labour between the two halves: the old-space figure
+       * above keeps ordinary load away from this threshold, and this field
+       * catches the growth that figure cannot bound. Change either and
+       * re-check the other -- the flag's figure must stay the smaller of the
+       * two.
        */
       max_memory_restart: '256M',
 
@@ -202,6 +256,17 @@ module.exports = {
        * `.env` counterpart with no diagnostic. The precedence, in one
        * sentence: the real environment (where PM2 sets `NODE_ENV`) beats
        * `.env`, which beats the defaults in `src/config/index.js`.
+       *
+       * AND DELETING THE KEY AGAIN DOES NOT UNDO IT, which is why the mistake
+       * is worth avoiding here rather than correcting later. Verified against
+       * PM2 7.0.4: `pm2 reload ... --update-env` adds and changes keys in this
+       * block, but a key REMOVED from it survives in the flattened process
+       * environment the daemon keeps for the application and is still injected
+       * into brand-new workers, so the shadowed `.env` value stays ignored
+       * after the deploy that was meant to restore it. Retiring a key takes a
+       * re-registration -- `pm2:delete` then `pm2:start`, then `pm2 save`;
+       * the procedure and the `pm2 env <id>` check are in `README.md`
+       * section 7.
        */
       env: {
         NODE_ENV: 'production'

@@ -9,8 +9,9 @@
  * `{ error: { status, message, requestId } }` envelope. There is exactly one
  * exception, and it is a supported path rather than a gap: a failure arriving
  * after `res.headersSent` cannot have its response replaced, so it is recorded
- * and then delegated to Express's default handler, which closes the connection
- * with whatever was already on the wire.
+ * and the connection is then closed deterministically on whatever was already
+ * on the wire -- by this module itself, for the log-hygiene reason set out at
+ * that branch, rather than by handing the error onward.
  *
  * POSITION 8 OF 8, REGISTERED LAST by src/app.js, which owns the pipeline
  * listing. This module registers nothing and imports nothing from app.js. The
@@ -111,6 +112,23 @@ const MIN_SENDABLE_ERROR_STATUS = 400;
 const MAX_SENDABLE_ERROR_STATUS = 599;
 
 /**
+ * Upper bound of the CLIENT-error class, and therefore the ceiling on the one
+ * status this file will accept from an error it did not create -- see
+ * `resolveExposedClientStatus`.
+ *
+ * It is deliberately narrower than `MAX_SENDABLE_ERROR_STATUS`: a foreign
+ * error may say "the caller got this wrong", which is a claim about the request
+ * and safe to relay, but it may never say "this service failed", because a
+ * server fault is precisely what the exception record and the production mask
+ * exist to handle. Anything at 500 or above from a foreign error resolves to
+ * `FALLBACK_STATUS` on the same path as an unrecognised failure, so it is
+ * recorded rather than quietly relayed.
+ *
+ * @type {number}
+ */
+const MAX_CLIENT_ERROR_STATUS = 499;
+
+/**
  * The discriminator allowlist: `err.type` values the body-parser family sets,
  * mapped to the status each one deserves.
  *
@@ -122,6 +140,7 @@ const MAX_SENDABLE_ERROR_STATUS = 599;
  *   entity.too.large      -> 413  body over BODY_LIMIT
  *   parameters.too.many   -> 413  urlencoded body with too many fields
  *   encoding.unsupported  -> 415  unsupported Content-Encoding
+ *   charset.unsupported   -> 415  unsupported charset on the Content-Type
  *   request.aborted       -> 400  client went away mid-body
  *
  * WHY A DISCRIMINATOR AND NOT AN ERROR CLASS. A malformed JSON body arrives
@@ -133,13 +152,30 @@ const MAX_SENDABLE_ERROR_STATUS = 599;
  * it a safe discriminator: its presence is evidence of where the failure came
  * from, which the class is not.
  *
- * WHY ALL FIVE ROWS AND NOT JUST THE TWO OBVIOUS ONES. Mapping only
+ * WHY EVERY ROW AND NOT JUST THE TWO OBVIOUS ONES. Mapping only
  * `entity.parse.failed` and `entity.too.large` -- the two a developer meets
  * first -- silently turns an ordinary oversized form submission
  * (`parameters.too.many`) into a masked 500: a real client error reported as a
  * server fault, with the cause hidden from the client and the operator alike.
- * `encoding.unsupported` and `request.aborted` fail the same way. Every row is
- * load-bearing; none is decoration.
+ * `encoding.unsupported`, `charset.unsupported` and `request.aborted` fail the
+ * same way. Every row is load-bearing; none is decoration.
+ *
+ * WHY `charset.unsupported` SITS BESIDE `encoding.unsupported` RATHER THAN
+ * BEING COVERED BY IT. They are two different headers and two different
+ * rejections, and only their status coincides. `encoding.unsupported` is a
+ * `Content-Encoding` the parser cannot decompress at all; `charset.unsupported`
+ * is a `Content-Type` charset parameter -- `application/json; charset=...` --
+ * that it cannot decode, raised from three separate sites in body-parser's
+ * reader, and it is a distinct token that a lookup on the other one never
+ * matches. Naming only one of the pair left an ordinary bad charset resolving
+ * to a masked 500 while its sibling answered 415 correctly, which is the
+ * asymmetry this row closes.
+ *
+ * WHAT IS DELIBERATELY ABSENT. The parser family also raises
+ * `stream.encoding.set` and `stream.not.readable`, both of which mean this
+ * service misused the request stream rather than that the client sent anything
+ * wrong. They carry no row, so they fall through to `FALLBACK_STATUS` and are
+ * recorded as the defects they are.
  *
  * @type {Readonly<Record<string, number>>}
  */
@@ -148,6 +184,7 @@ const PARSER_STATUS_BY_TYPE = Object.freeze({
   'entity.too.large': 413,
   'parameters.too.many': 413,
   'encoding.unsupported': 415,
+  'charset.unsupported': 415,
   'request.aborted': 400
 });
 
@@ -175,16 +212,98 @@ function isSendableErrorStatus(status) {
 }
 
 /**
+ * Reads the status a FOREIGN error declared for itself, but only where that
+ * error also declares the claim safe to relay to the caller and the claim is a
+ * client error.
+ *
+ * WHY THIS EXISTS AT ALL -- THE HOLE IT CLOSES. The `err.type` allowlist above
+ * covers the failures body-parser labels, and a labelled failure is the easy
+ * case. It does not cover the failures the parser produces WITHOUT a label,
+ * and there is a reachable class of them: a request body that declares a
+ * `Content-Encoding` the parser genuinely supports -- gzip, deflate or br --
+ * and then cannot be decompressed. body-parser wraps the raw zlib or brotli
+ * error with `createError(400, error)`, which yields `status`/`statusCode` 400
+ * and `expose` true but carries NO `err.type` of its own, because the type it
+ * would have had belongs to the decompressor rather than to the parser. With
+ * only the allowlist to consult, every such request answered a masked 500: a
+ * corrupt or truncated upload -- the client's fault, entirely ordinary -- was
+ * reported as this service failing, an exception record was written for it, and
+ * the per-status-class counter in src/lib/metrics.js recorded it in the 5xx
+ * bucket, which is the signal an operator uses to decide whether the service
+ * itself is broken. One bad upload could raise that signal.
+ *
+ * WHY TWO CONDITIONS AND NOT ONE, WHICH IS THE WHOLE OF THE CARE HERE.
+ * Trusting `err.status` alone would dissolve the allowlist: any error from any
+ * dependency could then choose this service's response status, and a bare
+ * `SyntaxError` -- the shape a programming defect in a handler arrives in --
+ * would only need a stray `status` property to be reported to a client as its
+ * own mistake. So both must hold:
+ *
+ *   1. `err.expose === true` -- the producing library's own statement that the
+ *      status and message describe the REQUEST and may be shown to whoever
+ *      sent it. http-errors sets it, and sets it to `status < 500`, so a
+ *      library reporting its own fault can never satisfy this.
+ *   2. The declared status is an integer in the client-error class, 400 to
+ *      `MAX_CLIENT_ERROR_STATUS`. A foreign error may not select a 5xx: see
+ *      that constant.
+ *
+ * A bare `SyntaxError` has neither field, so it still resolves to a masked 500.
+ * That is the hole this must not reopen, and it stays closed.
+ *
+ * WHY A VALUE TEST RATHER THAN AN OWN-PROPERTY TEST, unlike the allowlist
+ * lookup. http-errors defines `expose` on the PROTOTYPE of its generated
+ * classes -- verified: an `UnsupportedMediaTypeError` inherits it, while an
+ * error wrapped by `createError(400, err)` carries it directly -- so
+ * `Object.hasOwn` would reject exactly half of the library's own errors. A
+ * strict `=== true` comparison is safe here where a bare lookup was not in the
+ * allowlist: the allowlist's risk was resolving an inherited FUNCTION from
+ * `Object.prototype` and handing it to `res.status()`, whereas nothing on
+ * `Object.prototype` is the boolean `true`, and the status is then range-checked
+ * regardless.
+ *
+ * @param {*} err The delegated failure, of any shape. Nothing is assumed: a
+ *   nullish or primitive value short-circuits to `undefined`.
+ * @returns {number|undefined} The client-error status to send, or `undefined`
+ *   when the error made no relayable claim -- in which case the caller falls
+ *   through to `FALLBACK_STATUS`.
+ */
+function resolveExposedClientStatus(err) {
+  if (!err || err.expose !== true) {
+    return undefined;
+  }
+
+  // Both spellings are read because they are not equivalent in general:
+  // http-errors sets the pair, but a library that sets only `statusCode` is
+  // making the same claim and is honoured on the same terms. `status` is
+  // preferred when both are usable, matching the precedence http-errors itself
+  // applies when it derives one from an existing error.
+  for (const declared of [err.status, err.statusCode]) {
+    if (
+      Number.isInteger(declared) &&
+      declared >= MIN_SENDABLE_ERROR_STATUS &&
+      declared <= MAX_CLIENT_ERROR_STATUS
+    ) {
+      return declared;
+    }
+  }
+
+  return undefined;
+}
+
+/**
  * Resolves the HTTP status a failure should produce, in strict precedence
  * order: a typed `HttpError`'s own status, then the parser allowlist keyed on
- * `err.type`, then the masked fallback.
+ * `err.type`, then a foreign error's own exposed client-error status, then the
+ * masked fallback.
  *
  * WHY AN UNRECOGNISED ERROR STAYS A 500. A bare `SyntaxError` -- or anything
- * else carrying no `err.type` -- did not come from the parser, so it is a
- * defect in this service's code rather than bad input, and a defect must never
- * be reported to a client as its own mistake. The status stays 500 and the
- * real message is masked in production, while the exception record keeps it
- * for whoever has to fix it.
+ * else that neither carries an allowlisted `err.type` nor satisfies both
+ * conditions in `resolveExposedClientStatus` -- did not come from the parser
+ * and makes no relayable claim about the request, so it is a defect in this
+ * service's code rather than bad input, and a defect must never be reported to
+ * a client as its own mistake. The status stays 500 and the real message is
+ * masked in production, while the exception record keeps it for whoever has to
+ * fix it.
  *
  * WHY A TYPED ERROR'S STATUS IS CHECKED BEFORE IT IS TRUSTED. `err.status` is
  * an ordinary public field: `HttpError`'s constructor validates what it is
@@ -194,11 +313,16 @@ function isSendableErrorStatus(status) {
  * the fallback, which both keeps the envelope intact and, being a 5xx, records
  * the fault instead of letting it through as a response nobody can explain.
  *
- * `err.status` and `err.statusCode` on a NON-`HttpError` error are pointedly
- * not consulted. Honouring them would look like a harmless generalisation and
- * would dissolve the allowlist: any third-party error carrying a `status`
- * property could then choose this service's response status, including a 4xx
- * for what is really a server fault. Only the two recognised sources decide.
+ * `err.status` and `err.statusCode` on a NON-`HttpError` error are consulted
+ * only through `resolveExposedClientStatus`, and only on its two conditions
+ * together. Honouring them on their own would look like a harmless
+ * generalisation and would dissolve the allowlist: any third-party error
+ * carrying a `status` property could then choose this service's response
+ * status, including a 4xx for what is really a server fault. Requiring the
+ * producing library to have marked the error exposable AND the status to be a
+ * client error keeps that closed while covering the parser failures that carry
+ * no type of their own -- which is the difference between a corrupt upload
+ * answered as the client error it is and one reported as this service failing.
  *
  * @param {*} err The delegated failure. Typically an `Error`, but a handler is
  *   free to call `next()` with any truthy value, so nothing about its shape is
@@ -219,9 +343,19 @@ function resolveFailure(err) {
   // An own-property test rather than a bare lookup, because a bare lookup
   // reaches the prototype chain: an `err.type` of 'constructor' or 'toString'
   // would resolve to an inherited function and be handed to res.status(),
-  // which throws. Only the five rows declared above may decide a status.
+  // which throws. Only the rows declared above may decide a status this way.
   if (typeof type === 'string' && Object.hasOwn(PARSER_STATUS_BY_TYPE, type)) {
     return PARSER_STATUS_BY_TYPE[type];
+  }
+
+  // Last before the fallback, and last deliberately: an allowlisted type is a
+  // stronger statement about a failure than a status property is, so where a
+  // parser error carries both, the row above decides and this cannot override
+  // it. This branch only ever sees failures the rows do not name.
+  const exposedClientStatus = resolveExposedClientStatus(err);
+
+  if (exposedClientStatus !== undefined) {
+    return exposedClientStatus;
   }
 
   return FALLBACK_STATUS;
@@ -290,17 +424,20 @@ function resolveMessage(err, status) {
  * start-up to tell anyone. Every failure would instead reach Express's default
  * handler and answer an HTML body carrying no request id, and the only symptom
  * would be responses in the wrong shape. `next` must stay declared for that
- * reason alone even though exactly one path uses it, and `err` must stay
- * first.
+ * reason ALONE -- no path calls it, and the arity it contributes is its entire
+ * purpose, so deleting it as an unused parameter is the one edit to this file
+ * that breaks everything while looking like a tidy-up. `err` must stay first.
  *
  * CONTRACT. It always ends the request, in one of exactly two ways: by sending
- * the envelope, or -- when the response has already begun -- by delegating to
- * Express's default handler with `next(err)`. It never calls `next()` to
- * continue a chain, because there is no chain left. It sets no header by hand
- * and leaves helmet's headers from position 2 alone, reads no request body,
- * and touches no counters: src/middleware/request-context.js is the sole
- * writer to src/lib/metrics.js and counts by status on its own 'close' hook,
- * so incrementing anything here would double-count every failure.
+ * the envelope, or -- when the response has already begun and cannot be
+ * replaced -- by destroying the connection after recording the failure. It
+ * never calls `next` at all, in either role: there is no chain left to continue
+ * and, per the branch that ends the request, nothing is gained by handing the
+ * error onward. It sets no header by hand and leaves helmet's headers from
+ * position 2 alone, reads no request body, and touches no counters:
+ * src/middleware/request-context.js is the sole writer to src/lib/metrics.js
+ * and counts by status on its own 'close' hook, so incrementing anything here
+ * would double-count every failure.
  *
  * @param {*} err The delegated failure. An `HttpError` from `not-found.js` or
  *   `api.routes.js`, a body-parser error carrying `err.type`, a rejection from
@@ -313,13 +450,16 @@ function resolveMessage(err, status) {
  *   envelope's `requestId`; `method` and `path` -- the pathname, never the
  *   query string -- describe the failure in the log.
  * @param {import('express').Response} res The response. `headersSent` decides
- *   between sending and delegating; the envelope is sent through it.
- * @param {import('express').NextFunction} next Used on exactly one path --
- *   when headers are already sent -- and it must never be removed: dropping it
- *   changes the function's arity and, per the note above, silently unregisters
- *   this handler as an error handler altogether.
- * @returns {void} Nothing is returned; the outcome is the response sent or the
- *   error delegated.
+ *   between sending the envelope and destroying the connection, and both are
+ *   done through it.
+ * @param {import('express').NextFunction} next DECLARED BUT NEVER CALLED, and
+ *   it must never be removed: the four-parameter arity is what makes Express
+ *   dispatch errors here at all, so dropping this parameter -- the obvious
+ *   thing to do with one nothing references -- silently unregisters this
+ *   handler as an error handler altogether, per the note above. It is retained
+ *   as the dispatch contract rather than as an unused argument.
+ * @returns {void} Nothing is returned; the outcome is the response sent, or the
+ *   connection destroyed after the failure was recorded.
  */
 function errorHandler(err, req, res, next) {
   // Resolved once and reused. The status decides the masking, the exception
@@ -385,14 +525,42 @@ function errorHandler(err, req, res, next) {
   // Testing `headersSent` first and returning early would discard exactly those
   // records and leave nothing behind but a truncated response.
   //
-  // Delegation is the only correct action once headers are out: the status and
-  // the body are already on the wire and cannot be replaced, so Express's
-  // default handler takes over and closes the connection. `res.end()` or a
-  // second `res.json()` here would throw ERR_HTTP_HEADERS_SENT and turn a bad
-  // response into an unhandled error inside the error handler. This is the one
-  // path that uses `next`.
+  // ONCE HEADERS ARE OUT, THE ONLY REMAINING ACT IS TO END THE CONNECTION.
+  // The status and the body are already on the wire and cannot be replaced:
+  // `res.end()` or a second `res.json()` here would throw
+  // ERR_HTTP_HEADERS_SENT and turn a bad response into an unhandled error
+  // inside the pipeline's single exit. `res.destroy()` writes nothing, so it
+  // raises nothing -- verified -- and it closes the connection on whatever the
+  // client already received, which is exactly the outcome this path can offer.
+  //
+  // WHY THIS SERVICE DESTROYS THE CONNECTION ITSELF INSTEAD OF DELEGATING WITH
+  // `next(err)`. Delegating from the last error handler reaches Express's
+  // default final handler, and that handler does two things: it `console.error`s
+  // the raw `err.stack` -- and then destroys the socket anyway. The transport
+  // outcome is therefore identical either way; the only difference delegation
+  // makes is the console write, and that write is a contract violation on this
+  // service's terms. In production stdout is the newline-delimited JSON stream
+  // and standard error carries exactly one thing, the pre-logger
+  // configuration-failure record. A multi-line plain-text stack on standard
+  // error is unparseable by a consumer reading the stream a line at a time,
+  // carries no request id to correlate it with anything, and -- the reason this
+  // is a log-hygiene control rather than a formatting preference -- bypasses
+  // src/lib/logger.js entirely: neither its length bound nor its string
+  // scrubber applies, so a credential inside an error message that the
+  // structured record above correctly reduces to `[REDACTED]` would appear on
+  // standard error in clear text, in a stream that is captured to a file and
+  // retained. The record above is the account of this failure, it is complete,
+  // and one account is what this path should produce.
+  //
+  // No argument is passed to `res.destroy()`, and that is deliberate: an
+  // argument makes the response emit `'error'`, which would change the single
+  // access record src/middleware/request-context.js writes for this request
+  // from the outcome the client actually saw into an error-level record about
+  // the abort. Destroying without one emits only `'close'`, which is the event
+  // that both that access record and the in-flight counter already pair on.
   if (res.headersSent) {
-    return next(err);
+    res.destroy();
+    return;
   }
 
   // The envelope, exactly three fields.

@@ -11,6 +11,12 @@
  * writer. It formats no response, resolves no route and reads no
  * configuration.
  *
+ * It also OWNS the path policy -- how much of a request URL this service is
+ * willing to emit -- and exports it as `serializePath` beside the middleware,
+ * because `./not-found.js` must apply the identical bound and query-stripping
+ * to the 404 message it hands the caller. One implementation, so the record
+ * and the response can never disagree about the same request.
+ *
  * POSITION 1 OF 8, AND IT MUST BE FIRST. The pipeline `src/app.js` owns is:
  * 1 requestContext -> 2 helmet() -> 3 compression() -> 4 express.json() ->
  * 5 express.urlencoded() -> 6 router tree and `options.extraRouters` ->
@@ -76,10 +82,16 @@ const LEVEL_WARN = 'warn';
 const LEVEL_INFO = 'info';
 
 /**
- * Longest request path written to a record. A path is the resource identifier
- * and is kept whole in normal traffic; the bound exists because its length is
- * the caller's choice, and an unbounded value in a field written once per
- * request is an unbounded log line.
+ * Longest request path this service will emit, in a record OR in a response. A
+ * path is the resource identifier and is kept whole in normal traffic; the
+ * bound exists because its length is the caller's choice, and an unbounded
+ * value in a field written once per request is an unbounded log line.
+ *
+ * TWO CONSUMERS, ONE NUMBER. `serializePath()` below applies this bound to the
+ * `path` field of every access record, and -- since it is exported -- to the
+ * client-facing 404 message built in `./not-found.js`. Both are strings a
+ * caller sizes, so both answer to the same constant: a second copy of the
+ * number is how the log and the response drift apart.
  * @type {number}
  */
 const MAX_LOGGED_PATH_LENGTH = 512;
@@ -203,7 +215,11 @@ function customLogLevel(req, res, err) {
 }
 
 /**
- * Reduces a request URL to the path a record may carry: the pathname, bounded.
+ * Reduces a request URL to the path this service may emit: the pathname,
+ * bounded. THE ONE PATH POLICY, and it has two consumers: the `path` field of
+ * the access record built by `serializeRequest()` below, and the 404 message
+ * `./not-found.js` hands back to the caller (which is why this function is
+ * exported alongside the middleware -- see the export at the foot of the file).
  *
  * WHY THE QUERY STRING IS DROPPED RATHER THAN REDACTED. A query string is
  * caller-controlled and routinely carries credentials -- `?access_token=...`,
@@ -212,11 +228,15 @@ function customLogLevel(req, res, err) {
  * so one such record outlives the credential's usefulness by a long way. There
  * is no list of parameter names that could make keeping it safe, because the
  * names are the caller's to choose. The pathname is what identifies the
- * resource, and it is all this service needs to explain its own traffic.
+ * resource, and it is all this service needs to explain its own traffic. A
+ * response body is captured just as freely -- by proxies, CDNs and APM agents
+ * -- so the reasoning transfers unchanged to the 404 message, and applying one
+ * function to both is what keeps the two answers identical.
  *
  * @param {*} url The URL as pino's request serializer resolved it -- Express's
  *   `originalUrl`, so a router mounted under a prefix still reports the path
- *   the client actually sent.
+ *   the client actually sent. `./not-found.js` passes `req.originalUrl` for
+ *   exactly the same reason.
  * @returns {string} The pathname, truncated with an explicit marker beyond
  *   `MAX_LOGGED_PATH_LENGTH`, or the empty string when there is no URL to
  *   reduce -- the field is always present, so the record's shape never varies.
@@ -494,3 +514,25 @@ function requestContext(req, res, next) {
 }
 
 module.exports = requestContext;
+
+/*
+ * THE PATH POLICY, ATTACHED TO THE MIDDLEWARE RATHER THAN REPLACING IT.
+ *
+ * The export above stays the bare three-arity function: `src/app.js` requires
+ * this module and passes the import straight to `app.use()`, and its own
+ * comment records the contract as "exported by direct assignment -- no wrapper
+ * object". Turning the export into `{ requestContext, serializePath }` would
+ * break that at pipeline-build time. A named property on a function is the one
+ * shape that adds the second export without disturbing the first.
+ *
+ * WHY IT IS EXPORTED AT ALL. `./not-found.js` must apply the SAME bound and
+ * the SAME query-stripping to the client-facing 404 message that this module
+ * applies to the access record, and a second copy of the 512 and of the
+ * `... (truncated)` marker is precisely how the two drift apart -- a third
+ * restatement of the same number already lives in `./error-handler.js`, which
+ * is the arrangement that lets one copy change while the others do not.
+ * Sharing the function rather than the constants is what makes "one policy
+ * governs both the log and the response" a structural fact rather than a
+ * convention someone has to remember.
+ */
+module.exports.serializePath = serializePath;

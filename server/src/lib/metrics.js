@@ -265,7 +265,35 @@ function render() {
   // module whose whole point is to stay dependency-free and passive. Reading
   // them on the scrape path also means an idle process does no work at all.
   const uptimeSeconds = process.uptime();
+
+  // WHY THIS RSS FIGURE, AND WHAT MUST NOT BE BUILT ON IT.
+  // `process.memoryUsage().rss` is libuv's `uv_resident_set_memory()`, which
+  // reads field 24 of `/proc/<pid>/stat` and multiplies it by the page size.
+  // The kernel serves that field from batched per-CPU counters, so it is
+  // coarser than `/proc/<pid>/status` VmRSS -- the figure `ps -o rss=` and
+  // `smaps_rollup` report. Two consequences an operator will otherwise meet
+  // as a surprise: it under-reports VmRSS by around a tenth on this kernel,
+  // and it moves only in whole page-count quanta (1.5 MiB steps observed
+  // here), so it can stay byte-identical across minutes of traffic while real
+  // resident memory climbs.
+  //
+  // It is kept regardless, on two grounds. The plan names
+  // `process.memoryUsage()` as the source for the process figures; and PM2's
+  // own `max_memory_restart` accounting reads that same `/proc/<pid>/stat`
+  // field, so this gauge agrees with the supervisor that would act on it,
+  // which is exactly what makes it useful for reasoning about that threshold.
+  // `process.memoryUsage.rss()` is NOT a more accurate alternative: measured
+  // over 12 samples in both sampling orders it returns the identical value,
+  // so it is a cheaper call on the same source rather than a truer one, and
+  // switching to it would deviate from the plan for no gain.
+  //
+  // So read this gauge as a rough per-worker trend and as PM2's own view, and
+  // do NOT derive a container-limit or memory-growth alert from it -- those
+  // need VmRSS, `ps -o rss=` or the cgroup figure. `server/README.md`'s
+  // metrics section carries the measurements and a copy-pasteable cross-check
+  // against both OS sources.
   const residentMemoryBytes = process.memoryUsage().rss;
+
   const cpu = process.cpuUsage();
 
   // WHY the division by 1e6: `process.cpuUsage()` reports `user` and `system`
@@ -297,6 +325,18 @@ function render() {
 
   // `toFixed()` keeps the two fractional figures at a fixed width, so a
   // near-idle worker's CPU time reads as `0.000012` rather than `1.2e-5`.
+  //
+  // One `# HELP` docstring below is markedly longer than its five siblings:
+  // `process_resident_memory_bytes` states where its number comes from,
+  // because the value is coarser than the `ps`/VmRSS figure an operator will
+  // compare it against (see the WHY comment at its read site above) and a
+  // scrape read by hand is the only place that caveat can reach them. Any
+  // edit to these strings has three format constraints: a HELP docstring is
+  // terminated by the line break, so it must stay on ONE line; a backslash
+  // would have to be escaped for the text format, so none appears; and the
+  // rendered comment lines are kept digit-free, which is why the field
+  // ordinal and the measured figures live in the code comment and the runbook
+  // rather than in the served document.
   lines.push(
     '# HELP http_requests_in_flight HTTP requests currently being handled by this worker.',
     '# TYPE http_requests_in_flight gauge',
@@ -304,7 +344,7 @@ function render() {
     '# HELP process_uptime_seconds Seconds elapsed since this worker process started.',
     '# TYPE process_uptime_seconds gauge',
     `process_uptime_seconds ${uptimeSeconds.toFixed(3)}`,
-    '# HELP process_resident_memory_bytes Resident set size of this worker process, in bytes.',
+    '# HELP process_resident_memory_bytes Resident set size of this worker process, in bytes. Read by libuv from the rss field of /proc/<pid>/stat -- the same source the process supervisor compares against max_memory_restart, and coarser than ps, VmRSS or cgroup accounting -- so treat it as a trend, not a limit: see the metrics section of server/README.md.',
     '# TYPE process_resident_memory_bytes gauge',
     `process_resident_memory_bytes ${residentMemoryBytes}`,
     '# HELP process_cpu_seconds_total Total user plus system CPU time consumed by this worker, in seconds.',

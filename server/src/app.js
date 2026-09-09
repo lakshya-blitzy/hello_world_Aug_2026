@@ -162,6 +162,51 @@ function assertMountableRouters(extraRouters) {
 }
 
 /**
+ * Records the raw payload's byte length on the request, and does nothing else.
+ *
+ * Installed as `express.json()`'s `verify` hook at position 4. It is the ONLY
+ * thing this application does with the raw payload: it neither inspects the
+ * bytes nor rejects anything, because the whole point of the value is that the
+ * ROUTE decides what to do with it.
+ *
+ * WHY THE BYTE COUNT HAS TO BE CAPTURED HERE. The JSON parser special-cases a
+ * payload of no bytes and yields `{}` for it instead of raising a parse error,
+ * so a request that carried nothing and a request that carried the two bytes
+ * `{}` arrive at a handler as the same parsed value and cannot be told apart
+ * from `req.body` alone. The raw byte count is the only signal that separates
+ * them, and it exists only while the payload is still a buffer -- which is
+ * exactly the moment this hook runs. `src/routes/api.routes.js` consumes it to
+ * reject an absent payload while echoing a legitimately empty object.
+ *
+ * WHY IT MUST NEVER THROW, AND WHY IT CANNOT. body-parser converts anything
+ * thrown from a `verify` hook into a `403 entity.verify.failed`, a status this
+ * service's contract does not contain and the error handler does not allowlist.
+ * A single property assignment from an argument the caller guarantees is a
+ * buffer has nothing in it that can throw, and nothing may be added here that
+ * does.
+ *
+ * WHEN IT IS NOT CALLED, which the consumer must allow for. body-parser skips
+ * the read entirely -- and therefore this hook -- when the request carries no
+ * payload framing at all (neither `Content-Length` nor `Transfer-Encoding`) or
+ * declares a media type this parser does not handle. In both cases `req.body`
+ * is left `undefined` and no byte count is recorded, so a consumer must treat
+ * a missing value as "no payload was read" rather than as a length of zero.
+ *
+ * @param {import('express').Request} req The request being parsed. Receives
+ *   `rawBodyLength`, the payload's length in bytes after any
+ *   `Content-Encoding` inflation and before character decoding.
+ * @param {import('express').Response} res The response, unused: this hook
+ *   writes nothing and ends nothing.
+ * @param {Buffer} buf The raw payload. Supplying a `verify` hook makes
+ *   body-parser read the payload as a buffer and decode it afterwards, so this
+ *   is a byte count rather than a character count.
+ * @returns {void} Nothing, and it never throws.
+ */
+function recordRawBodyLength(req, res, buf) {
+  req.rawBodyLength = buf.length;
+}
+
+/**
  * Builds the configured Express application: settings, the eight-position
  * middleware pipeline, and the mounted router tree.
  *
@@ -294,14 +339,31 @@ function createApp({ extraRouters = [] } = {}) {
   // the small probe payloads pass through untouched.
   app.use(compression());
 
-  // POSITION 4 -- JSON body parsing, bounded.
+  // POSITION 4 -- JSON body parsing, bounded, with the raw payload's byte
+  // length recorded as it goes past.
   //
   // `config.bodyLimit` is the operator-settable ceiling, already validated by
   // the configuration module against `^\d+(kb|mb)?$` with a hard 1 MB cap, and
   // passed through as the string it is. An over-limit body becomes an
   // `entity.too.large` error that position 8 renders as 413; a malformed one
   // becomes `entity.parse.failed`, rendered 400.
-  app.use(express.json({ limit: config.bodyLimit }));
+  //
+  // WHY THE `verify` HOOK IS HERE AND IS NOT OPTIONAL. The parser special-cases
+  // a payload of no bytes and yields `{}` for it rather than failing to parse
+  // it, so an ABSENT payload and a literal `{}` are indistinguishable from the
+  // parsed value alone -- and the contract answers them differently: an empty
+  // object is a legitimate body echoed at 200, while no payload at all is a
+  // 400. The byte count is the only signal that separates the two, it survives
+  // only while the payload is still a buffer, and this is the one position in
+  // the pipeline that sees it. `src/routes/api.routes.js` reads it back off the
+  // request; nothing else in the pipeline depends on it.
+  //
+  // The hook records the length and nothing else, and it MUST NEVER THROW:
+  // body-parser turns a throw from `verify` into a `403 entity.verify.failed`,
+  // inventing a status this service's contract does not have.
+  app.use(
+    express.json({ limit: config.bodyLimit, verify: recordRawBodyLength })
+  );
 
   // POSITION 5 -- form body parsing, bounded by the same limit.
   //

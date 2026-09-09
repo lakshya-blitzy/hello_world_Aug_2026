@@ -29,11 +29,16 @@
 // fingerprinting with no requirement behind them.
 //
 // THE BODY CONTRACT THIS MODULE IMPLEMENTS, and all of it: the request must
-// declare application/json, and the parsed body must then be a JSON object
-// with at least one key, or an array. Nothing else is checked here, and
-// nothing checked here is checked twice -- reading a body off the wire is
-// express.json()'s job, bounded by config.bodyLimit, and formatting a failure
-// into the { error: { status, message, requestId } } envelope is
+// declare application/json, it must actually carry a payload, and the parsed
+// body must then be a JSON object -- which may be empty -- or an array.
+// Emptiness is judged on the RAW PAYLOAD BYTES rather than on the parsed
+// value, because express.json() synthesises `{}` for a payload of no bytes,
+// which makes an absent body and a literal `{}` the same parsed value; the
+// byte count comes from the verify hook at pipeline position 4 in src/app.js.
+// Nothing else is checked here, and nothing checked here is checked twice --
+// reading a body off the wire is express.json()'s job, bounded by
+// config.bodyLimit, and formatting a failure into the
+// { error: { status, message, requestId } } envelope is
 // src/middleware/error-handler.js's. That division is also why this file
 // declares no 405 handler: a method or path this router does not match reaches
 // the notFound middleware and becomes a 404.
@@ -66,24 +71,27 @@ const router = express.Router();
  * with the correlation id of the request that carried it.
  *
  * Served at POST /api/v1/echo once src/routes/index.js has mounted this router.
- * Two checks run, in this order and no others: the declared media type, then
- * the shape of the already-parsed body. Both are in-memory, which is why the
- * handler is synchronous with nothing to await, and it carries no try/catch or
- * async-error shim -- Express 5 forwards a rejected promise from an async
- * handler to the four-arity error middleware on its own, so a wrapper here
- * would be dead code.
+ * Three checks run, in this order and no others: the declared media type, then
+ * the raw payload's byte count, then the shape of the already-parsed body. All
+ * three are in-memory, which is why the handler is synchronous with nothing to
+ * await, and it carries no try/catch or async-error shim -- Express 5 forwards
+ * a rejected promise from an async handler to the four-arity error middleware
+ * on its own, so a wrapper here would be dead code.
  *
  * Statuses this handler produces itself, each rejection delegated with
  * `next(err)` as an HttpError rather than written to the response here:
- * - `200` with `{ echo: <parsed body>, requestId }` when both checks pass, so
- *   `echo` is always present and is always an object with at least one key or
- *   an array. An empty array is echoed; an empty object is not a body and is
- *   rejected below.
+ * - `200` with `{ echo: <parsed body>, requestId }` when all three checks
+ *   pass, so `echo` is always present and is always an object or an array. An
+ *   empty array and an empty object are both echoed: `[]` and `{}` are bodies
+ *   a client sent deliberately, and neither is what "no body" means here.
  * - `400` when the request does not declare `application/json` -- a
  *   form-encoded body, which the urlencoded parser would otherwise hand over
  *   as a perfectly good object, included.
- * - `400` when the parsed body is absent, `null`, not an object, or a plain
- *   object with no keys.
+ * - `400` when the request carried no payload bytes: a zero-length payload, or
+ *   a chunked message that streams nothing. Judged on the byte count recorded
+ *   at pipeline position 4, never on the parsed value, which cannot tell that
+ *   case apart from a literal `{}`.
+ * - `400` when the parsed body is `null` or is not an object.
  *
  * Statuses produced upstream of this handler, and deliberately not implemented
  * in it. Each is raised by a body parser before the router is reached -- for a
@@ -100,8 +108,11 @@ const router = express.Router();
  * and becomes a `404` -- which is why there is no 405 branch and no GET /echo.
  *
  * @param {import('express').Request} req The request. Reads
- *   `req.is('application/json')` for the declared media type, `req.body` as
- *   produced by the upstream JSON parser, and `req.id` for the correlation id.
+ *   `req.is('application/json')` for the declared media type,
+ *   `req.rawBodyLength` -- the raw payload's byte count, recorded by the
+ *   `verify` hook at pipeline position 4 in src/app.js and absent when no
+ *   payload was read at all -- `req.body` as produced by the upstream JSON
+ *   parser, and `req.id` for the correlation id.
  * @param {import('express').Response} res The response, used only on the
  *   success path.
  * @param {import('express').NextFunction} next Delegates a rejection to
@@ -125,6 +136,29 @@ router.post('/echo', (req, res, next) => {
     );
   }
 
+  // AN ABSENT PAYLOAD IS NOT A BODY, AND THE PARSED VALUE CANNOT SAY SO.
+  // express.json() special-cases a payload of no bytes and yields `{}` for it
+  // instead of failing to parse it, so `req.body` is `{}` both for a request
+  // that sent nothing and for one that sent the two bytes `{}` -- and the
+  // contract answers those differently: an empty object is a body, echoed at
+  // 200, while no payload at all is this 400. The raw byte count recorded by
+  // the `verify` hook at pipeline position 4 in src/app.js is the only signal
+  // that separates them, which is why this guard reads it rather than
+  // `Object.keys(req.body)`. Both empty-payload framings are rejected here: a
+  // declared `Content-Length: 0` and a `Transfer-Encoding: chunked` message
+  // that streams no bytes each arrive with a count of `0`.
+  //
+  // A count that is not a number means the JSON parser never read a payload
+  // for this request -- body-parser skips the read, and therefore the hook,
+  // when the request carries no payload framing at all -- so that case is an
+  // absent body too and is rejected with the same message. The media-type
+  // check above already answers it, since `req.is()` is `null` without
+  // framing; this half is the belt and braces that keeps "no bytes read" from
+  // ever reaching the shape check as a synthesised `{}`.
+  if (typeof req.rawBodyLength !== 'number' || req.rawBodyLength === 0) {
+    return next(new HttpError(400, 'Request body is required'));
+  }
+
   // The parser's strict mode rejects a bare scalar of its own accord, so this
   // guard is not the primary defence. It is deliberate rather than dead: it
   // makes "echo is an object or an array" a property this handler enforces
@@ -133,18 +167,6 @@ router.post('/echo', (req, res, next) => {
     return next(
       new HttpError(400, 'Request body must be a JSON object or array'),
     );
-  }
-
-  // AN EMPTY OBJECT IS NOT A BODY. Plan sections 0.5.3 and 0.9 both require
-  // 400 for an empty body, and 0.5.1 pins position 4 as exactly
-  // `express.json({ limit })`: with no `verify` hook the parser yields `{}`
-  // for an empty payload, so no bytes and the two bytes `{}` are one value
-  // here. Rejecting a zero-key plain object is the only way to satisfy 0.9
-  // under those pinned options; a `verify` byte-count hook was considered and
-  // declined as a 0.5.1 deviation. An empty ARRAY is different in kind: only
-  // ever sent deliberately, never synthesised, so `[]` is echoed unchanged.
-  if (!Array.isArray(req.body) && Object.keys(req.body).length === 0) {
-    return next(new HttpError(400, 'Request body is required'));
   }
 
   // `requestId` is req.id, read and never minted here: a locally generated id

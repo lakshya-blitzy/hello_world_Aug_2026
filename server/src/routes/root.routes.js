@@ -72,6 +72,17 @@ const ROOT_BODY_BYTE_LENGTH = Buffer.byteLength(ROOT_BODY);
  * text/plain; charset=utf-8`, and the 14-byte body `Hello, World!\n`
  * (a trailing newline included, so the payload reads cleanly in a terminal).
  *
+ * THIS HANDLER ALSO ANSWERS `HEAD /`, and deliberately declares nothing for
+ * it. The router package resolves `HEAD` against this `GET` route because no
+ * explicit `HEAD` handler exists, so the status and both headers below are the
+ * ones a `HEAD` caller receives; Node suppresses the body itself, because it
+ * marks a response to a `HEAD` request as carrying none. `Content-Length: 14`
+ * is retained on that empty answer, which is what RFC 9110 asks for -- the
+ * header describes the representation the matching `GET` would return, not the
+ * bytes on this particular wire. Declaring a `HEAD` handler here, or trimming
+ * the header for it, would break that parity rather than complete it. The
+ * method reaches this route because `./index.js` sanctions it at the gate.
+ *
  * The handler is deliberately synchronous and has no failure path. It reads no
  * input, performs no I/O and consults no state, so there is no condition it
  * could reject and nothing that could throw -- which is why it takes no

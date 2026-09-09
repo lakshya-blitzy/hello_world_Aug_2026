@@ -36,6 +36,15 @@ prerequisites in section 8 of the runbook,
 in front of this plain-HTTP listener, `TRUST_PROXY` is set only when that
 topology justifies it, and `GET /metrics` is restricted to internal callers.
 
+Both forms run in the foreground, and `Ctrl+C` stops them cleanly because the
+terminal signals the whole process group, so the drain reaches the `node`
+process. A script or a supervisor must **not** signal the PID of `npm start`:
+`npm run-script` relays no signal to what it spawns, so the wrapper dies and
+the service keeps running with the port still bound. Run `node src/server.js`
+directly — which is what the PM2 descriptor does — or signal the process
+group. The exact forms, with their caveats, are in section 5 of the runbook,
+[`server/README.md`](server/README.md#5-running-locally).
+
 ## Documentation
 
 [`server/README.md`](server/README.md) is the canonical runbook: prerequisites,

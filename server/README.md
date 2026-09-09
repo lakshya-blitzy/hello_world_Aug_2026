@@ -276,6 +276,16 @@ production. Everything else in the table above belongs to `server/.env`.
 > **Warning.** Adding any other key to the descriptor's `env` block silently
 > disables its `.env` counterpart. If `PORT` were added there, editing `PORT`
 > in `.env` would stop having any effect and nothing would say so.
+>
+> **And deleting the key again does not undo it.** Verified with PM2 7.0.4:
+> `pm2 reload … --update-env` adds and changes keys in that block, but a key
+> *removed* from it survives in the flattened process environment PM2 keeps
+> for the application and is still injected into brand-new workers — so the
+> `.env` value stays shadowed after the very deploy that was meant to restore
+> it, again with nothing saying so. Retiring a key takes a re-registration,
+> `npm run pm2:delete && npm run pm2:start` followed by `pm2 save`, and
+> [reload versus scale](#reload-versus-scale) has the sequence and the
+> `pm2 env <id>` check that confirms what a worker actually carries.
 
 ### `NODE_APP_INSTANCE`
 
@@ -329,10 +339,111 @@ Outside production the logger attaches a `pino-pretty` transport, so output is
 human-readable text rather than NDJSON. The raw NDJSON contract described in
 [section 9](#9-reading-the-logs) applies to production only.
 
-Stop a foreground process with `Ctrl+C`. That is `SIGINT`, which is the same
-handled two-phase drain PM2 uses, so expect a `Drain started` line, a pause of
-`DRAIN_DELAY_MS`, then `Drain complete; exiting` — not an instant exit. This
-is deliberate and is explained in [section 7](#7-operating-under-pm2).
+### Stopping it
+
+Stop a foreground run with `Ctrl+C`. That is `SIGINT`, and it works because
+the terminal delivers it to the **whole foreground process group** — so it
+reaches the `node` process itself, not only the `npm` wrapper in front of it.
+What follows is the same handled two-phase drain PM2 uses: a `Drain started`
+line, a pause of `DRAIN_DELAY_MS` (default 2000), then
+`Drain complete; exiting` and exit `0` — not an instant exit. This is
+deliberate, and the two phases are explained in
+[section 7](#7-operating-under-pm2).
+
+**A script or a supervisor must not signal the PID of `npm start` or
+`npm run dev`.** `npm run-script` relays no signal to the shell subtree it
+spawns, and that shell *forks* rather than *execs* `node`, so two processes
+stand between the PID a caller captured and the service that handles signals:
+
+```text
+npm start                       <- the PID `$!` hands back
+└─ sh -c node src/server.js
+   └─ node src/server.js        <- the only process with the drain handlers
+```
+
+Signalling that wrapper PID has two measured outcomes, both wrong:
+
+- `SIGTERM` kills the wrapper at once — exit `143` in 0.01 s — and
+  **orphans the service**, which is reparented to `PPid: 1`, keeps serving
+  and keeps the TCP port bound; `GET /health` still answers `200`.
+- `SIGINT` is ignored outright: the wrapper was still alive at t+8 s with the
+  service still serving, and a scripted `wait` on that PID does not return —
+  it blocked past 45 s in one measured run and for about 290 s in another,
+  each time until it was abandoned. A naive stop script hangs rather than
+  fails, which is the worse failure of the two.
+
+Three forms do work. Prefer the first for anything non-interactive — it is
+what `ecosystem.config.js` runs in production — because it removes the
+wrapper altogether, so the PID you hold *is* the service:
+
+```bash
+# Form 1 -- run the service directly: no npm, no intervening shell.
+node src/server.js &          # start it; $! is the node process itself
+service=$!                    # keep that PID -- it carries the handlers
+
+# ... the service serves for as long as you need it, then:
+
+kill -TERM "$service"         # opens the two-phase drain
+wait "$service"               # returns 0 after 2.01 s, one DRAIN_DELAY_MS
+
+# The log carries one `Drain started` and one `Drain complete; exiting`, and
+# the port is free once `wait` returns. `NODE_ENV=development node
+# src/server.js` is the `npm run dev` equivalent and behaves identically.
+```
+
+If the npm script has to stay, signal the group rather than one PID — the
+same thing the terminal does on `Ctrl+C`:
+
+```bash
+# Form 2 -- keep npm, signal the whole process group.
+# `setsid` makes the run its own group leader, so $! is also the group id.
+mkdir -p logs                 # logs/ is where this service's files go, and is
+                              # git-ignored -- so a redirect cannot be committed
+setsid npm start > logs/run.log 2>&1 < /dev/null &
+pgid=$!
+
+# ... the service serves for as long as you need it, then:
+
+kill -TERM -"$pgid"           # the leading minus targets the GROUP, not a PID
+
+# logs/run.log then carries both `Drain started` and `Drain complete; exiting`,
+# the port is released after about 2 s, and no member of the group survives.
+```
+
+Two caveats come with Form 2, and neither is optional reading:
+
+- **Do not trust its exit status.** `wait "$pgid"` returns `143`
+  immediately, because npm dies at once while the service is still draining.
+  A script that reads that as "stopped" and checks the port straight away
+  finds it briefly still bound. Poll for the port's release instead.
+- **`$!` is the group leader only in a non-interactive script**, which is
+  where this form belongs; `ps -o pgid= -p $!` equal to `$!` is the check.
+  An interactive shell has already put the job in its own group, which makes
+  `setsid` fork — and then `$!` is no longer the leader.
+
+The third form keeps npm and reaches past it to the service by walking the
+two-process chain above:
+
+```bash
+# Form 3 -- keep npm, signal the service PID.
+mkdir -p logs                 # as in Form 2: a git-ignored destination
+npm start > logs/run.log 2>&1 &
+wrapper=$!
+
+# ... the service serves for as long as you need it, then:
+
+# The wrapper's child is `sh -c ...`; that shell's child is the node process.
+service=$(pgrep -P "$(pgrep -P "$wrapper" | head -1)" | head -1)
+kill -TERM "$service"         # drains exactly as in Form 1
+wait "$wrapper"               # wrapper exits 0 after 2.01 s, port then free
+```
+
+If a run has already been orphaned, the survivor is still recoverable. Find
+it with `pgrep -f 'node src/server.js'`, confirm the working directory of the
+PID you get — `ls -l /proc/<pid>/cwd`, because that pattern matches any copy
+of this service on the host — and send it `SIGTERM` directly. It drains
+normally: `Drain started`, the `DRAIN_DELAY_MS` pause,
+`Drain complete; exiting`, and the port is released.
 
 ## 6. Endpoint reference
 
@@ -342,21 +453,46 @@ is deliberate and is explained in [section 7](#7-operating-under-pm2).
 | `GET /health` | `200` JSON `{ status: "ok", service, uptime, pid, instance, timestamp }` | — |
 | `GET /health/ready` | `200` JSON `{ status: "ready" }` | `503` JSON `{ status: "shutting_down" }` once a drain has begun |
 | `GET /metrics` | `200`, `text/plain; version=0.0.4`, Prometheus exposition format | — |
+| `HEAD` on any of the four `GET` paths above | that `GET`'s status and headers, with no body | that `GET`'s failure, with no body |
 | `POST /api/v1/echo` | `200` JSON `{ echo: <body>, requestId }` | `400` non-JSON media type, or an absent, empty, non-object or malformed body; `413` over `BODY_LIMIT`; `415` unsupported content encoding |
 | any unmatched path | — | `404` JSON `{ error: { status, message, requestId } }` |
-| any method other than `GET` or `POST` | — | `404` JSON `{ error: { status, message, requestId } }`, `HEAD` and `OPTIONS` included |
+| any method other than `GET`, `HEAD` or `POST` | — | `404` JSON `{ error: { status, message, requestId } }`, `OPTIONS` included |
 
-**Only `GET` and `POST` reach the routes above.** A method gate ahead of the
-mounts admits those two and nothing else, so every other method — `HEAD` and
+**`GET`, `HEAD` and `POST` reach the routes above; nothing else does.** A
+method gate ahead of the mounts admits those three, so every other method —
 `OPTIONS` included — falls through to the same terminal `404` envelope, whose
-message names the method it rejected (`Cannot OPTIONS /health`); on a `HEAD`
-the status is the whole answer, because HTTP allows that response no body.
-`HEAD` on a `GET` route is therefore **not** served, even though Express would
-ordinarily answer it from the `GET` route: **configure a health check or
-uptime monitor to probe with `GET`, not `HEAD`**, or every probe reads back as
-a hard failure. The gate writes no status, body or header of its own, so no
-`405` and no `Allow` header is produced on any path — `OPTIONS` is a plain
-`404` rather than the `200` with `Allow` Express would otherwise send.
+message names the method it rejected (`Cannot OPTIONS /health`). The gate
+writes no status, body or header of its own, so **no `405` and no `Allow`
+header is produced on any path** — `OPTIONS` is a plain `404` rather than the
+`200` with `Allow` Express would otherwise send, and suppressing that is the
+gate's only purpose.
+
+**`HEAD` is served on all four read paths** — `/`, `/health`, `/health/ready`
+and `/metrics` — and answers with **the same status and the same headers as
+the matching `GET`, and no body**, which is what RFC 9110 requires. No route
+declares a `HEAD` handler and none needs to: Express answers `HEAD` from the
+path's own `GET` route, and Node suppresses the body. Two consequences are
+worth knowing before you configure anything against it:
+
+- **A `HEAD` probe is a valid health check.** `HEAD /health/ready` returns the
+  same `200` and the same draining `503` as the `GET`, so a proxy, load
+  balancer or uptime monitor that probes with `HEAD` — HAProxy's
+  `option httpchk HEAD /` and many CDN and LB defaults do — reads the
+  readiness state correctly from the status line.
+  [Section 8.4](#84-configure-the-reverse-proxy-and-tls) still specifies
+  `GET /health/ready` for the proxy, because a `GET` also returns the body,
+  which is the more useful thing to have in a proxy's own log; a `HEAD` check
+  is supported rather than preferred.
+- **`curl -I` works, including on `/metrics`.** It is the cheapest way to read
+  that endpoint's `text/plain; version=0.0.4` content type without
+  downloading the exposition document. On `/` and the two probes the `HEAD`
+  answer keeps the `Content-Length` of the body a `GET` would return, so the
+  header describes the representation rather than the empty wire; `/metrics`
+  sets no `Content-Length` on either method, so its `HEAD` answer carries none.
+
+`HEAD` on a path with no `GET` is a `404` like any other unmatched request:
+`HEAD /api/v1/echo` is `404`, because `/api/v1/echo` declares `POST` only and
+there is no `GET` for a `HEAD` to mirror.
 
 Every route is served on `HOST:PORT`. The examples below assume the default
 `localhost:3000`.
@@ -444,8 +580,9 @@ curl -s http://localhost:3000/metrics | head -6
 ```
 
 **`POST /api/v1/echo`** — echoes a JSON object or array back with the request
-id. The request must declare `Content-Type: application/json`, and the parsed
-body must be a JSON object carrying at least one key, or an array.
+id. The request must declare `Content-Type: application/json`, it must actually
+carry a payload, and the parsed body must be a JSON object — an empty one
+included — or an array.
 
 ```bash
 curl -s -X POST http://localhost:3000/api/v1/echo \
@@ -459,14 +596,17 @@ curl -s -X POST http://localhost:3000/api/v1/echo \
 # {"echo":[],"requestId":"..."}
 ```
 
-**An empty JSON object `{}` is rejected; an empty array `[]` is not.** The two
-are not symmetric, and the reason is the parser: `express.json()` special-cases
-an empty payload and yields `{}` for it rather than raising a parse error, so a
-request that carried no bytes and a request that carried the two bytes `{}`
-reach the endpoint as the same value and cannot be told apart. An empty body is
-a `400`, so a zero-key object is one too. An empty array can only come from a
-client that explicitly sent `[]` — the parser never produces one — so it is a
-deliberate body and is echoed back unchanged.
+**An empty JSON object `{}` is echoed at `200` like any other object; what is
+rejected is an empty PAYLOAD.** The two look alike from inside the endpoint and
+are told apart deliberately, because the parser conflates them:
+`express.json()` special-cases a payload of no bytes and yields `{}` for it
+rather than raising a parse error, so a request that carried no bytes and a
+request that carried the two bytes `{}` reach the endpoint as the same parsed
+value. The endpoint therefore judges emptiness on the raw payload's BYTE COUNT,
+recorded as the payload goes past body-parser position 4 in the pipeline, and
+never on the parsed value: two bytes is a body, zero bytes is not. `{}` and
+`[]` are symmetric under that rule — both are bodies a client sent
+deliberately, and both are echoed back unchanged.
 
 Every rejection below is a `400` that names the fault it actually found, in
 the same `{ error: { status, message, requestId } }` envelope. The endpoint
@@ -479,9 +619,11 @@ owns three messages, checked in this order:
   neither a `Content-Length` nor a `Transfer-Encoding` header there is no
   payload for the declared media type to describe, which is what a
   `curl -X POST` with no `--data` sends.
-- **An empty body** is `Request body is required`. That covers a zero-length
-  payload (`Content-Length: 0`), a `Transfer-Encoding: chunked` message that
-  streams no bytes, and a literal `{}` — all three arrive as an empty object.
+- **An empty payload** is `Request body is required`. That covers a
+  zero-length payload (`Content-Length: 0`) and a `Transfer-Encoding: chunked`
+  message that streams no bytes — the two ways to declare a body and then send
+  no bytes of one. A literal `{}` is **not** covered: it carried two bytes, so
+  it is a body and is echoed.
 - **A parsed body that is neither an object nor an array** is `Request body
   must be a JSON object or array`.
 
@@ -491,12 +633,24 @@ their message is the JSON parser's own and the error handler maps the parser's
 `Unexpected end of JSON input` for a truncated object, and **a bare scalar
 such as `42`**, `Unexpected token '4', "42" is not valid JSON`.
 
-A body over `BODY_LIMIT` is `413` (`request entity too large`); an
-unsupported `Content-Encoding` is `415`.
+A body over `BODY_LIMIT` is `413` (`request entity too large`). An unsupported
+`Content-Encoding` is `415`, and so is an unsupported **charset** on the
+`Content-Type` — `application/json; charset=…` — a different header and a
+different rejection that happens to share the status. A body that declares an
+encoding the parser *does* support — `gzip`, `deflate` or `br` — and then
+cannot be decompressed is a `400` carrying the decompressor's own message
+(`incorrect header check` for gzip and deflate, `Decompression failed` for
+brotli). All three are the client's fault and are answered as such, which also
+keeps them out of the `5xx` bucket of
+[`/metrics`](#10-metrics-and-their-honest-limitation) — that bucket is the
+signal for the service failing, not for a caller sending a corrupt upload.
 
-Emptiness is judged on the parsed value, which is the only thing the endpoint
-sees: two in-memory checks run, the media type and then the shape, and nothing
-inspects the request stream or the framing headers on their own.
+Three in-memory checks run, in this order: the media type, then the raw
+payload's byte count, then the parsed shape. Emptiness is judged on that byte
+count — captured while the payload is still a buffer, which is the only moment
+it exists — rather than on the parsed value, which cannot tell an absent
+payload from a literal `{}`. Nothing re-reads the request stream, and no
+framing header is inspected on its own.
 
 ```bash
 # 400 -- no payload framing at all, so the media type has nothing to describe
@@ -504,12 +658,13 @@ curl -s -X POST http://localhost:3000/api/v1/echo \
   -H 'Content-Type: application/json'
 # {"error":{"status":400,"message":"Request Content-Type must be application/json","requestId":"..."}}
 
-# 400 -- a literal empty object, indistinguishable from an absent payload
+# 200 -- a literal empty object is a body: two bytes were sent, so it is
+#        echoed back unchanged
 curl -s -X POST http://localhost:3000/api/v1/echo \
   -H 'Content-Type: application/json' -d '{}'
-# {"error":{"status":400,"message":"Request body is required","requestId":"..."}}
+# {"echo":{},"requestId":"..."}
 
-# 400 -- a zero-length payload, the same reason
+# 400 -- a zero-length payload: a body was declared and no bytes were sent
 curl -s -X POST http://localhost:3000/api/v1/echo \
   -H 'Content-Type: application/json' --data ''
 # {"error":{"status":400,"message":"Request body is required","requestId":"..."}}
@@ -546,6 +701,18 @@ curl -s -X POST http://localhost:3000/api/v1/echo \
   -H 'Content-Type: application/json' -H 'Content-Encoding: foo' \
   -d '{"a":1}'
 # {"error":{"status":415,"message":"unsupported content encoding \"foo\"","requestId":"..."}}
+
+# 415 -- a charset the parser cannot decode, on an otherwise valid media type
+curl -s -X POST http://localhost:3000/api/v1/echo \
+  -H 'Content-Type: application/json; charset=nonesuch' \
+  -d '{"a":1}'
+# {"error":{"status":415,"message":"unsupported charset \"NONESUCH\"","requestId":"..."}}
+
+# 400 -- a supported encoding whose payload will not decompress
+printf 'not really gzip' | curl -s -X POST http://localhost:3000/api/v1/echo \
+  -H 'Content-Type: application/json' -H 'Content-Encoding: gzip' \
+  --data-binary @-
+# {"error":{"status":400,"message":"incorrect header check","requestId":"..."}}
 ```
 
 The media-type check is not redundant with the body-shape check: without it, a
@@ -574,7 +741,7 @@ curl -s http://localhost:3000/nope
 
 It is not a product capability. It exists so that routing and the middleware
 pipeline are verifiable end to end — it exercises the JSON parser, the size
-limit, three of the five mapped parser statuses, request-id propagation and,
+limit, four of the six mapped parser statuses, request-id propagation and,
 with a large enough response, compression. It is expected to be replaced by
 real business routes, and nothing else in the service depends on it.
 
@@ -635,7 +802,7 @@ it is invoked from.
 |---|---|---|
 | start | `npm run pm2:start` | `pm2 start ecosystem.config.js` — starts two cluster workers under the name `hello-world-service` |
 | reload | `npm run pm2:reload` | `pm2 reload ecosystem.config.js --update-env` — the drain-aware deploy path; re-reads the descriptor |
-| scale | `npm run pm2:scale -- <n>` | `pm2 scale hello-world-service <n>` — change the worker count |
+| scale | `npm run pm2:scale -- <n>` | `pm2 scale hello-world-service <n>` — change the worker count. **`<n>` must be at least 1:** `-- 0` deletes the application rather than stopping it, and [`pm2:scale` cannot undo that](#reload-versus-scale) |
 | stop | `npm run pm2:stop` | `pm2 stop ecosystem.config.js` — handled shutdown of every worker, application left registered |
 | delete | `npm run pm2:delete` | `pm2 delete ecosystem.config.js` — stop and remove the application from PM2 |
 | logs | `npm run pm2:logs` | `pm2 logs hello-world-service` — tail this application's log files |
@@ -736,6 +903,21 @@ The whole sequence is bounded by `SHUTDOWN_TIMEOUT_MS`, which is itself held
 below PM2's `kill_timeout` of 12000 so that the application ends its own drain
 rather than being killed mid-flight.
 
+**What PM2's own daemon log looks like while that happens, because it reads
+worse than it is.** For every retiring worker, `$PM2_HOME/pm2.log` —
+`pm2 logs PM2`, not `npm run pm2:logs` — fills with
+`pid=<n> msg=failed to kill - retrying in 100ms`, one line every 100 ms for as
+long as the drain lasts, so a healthy in-budget reload writes 15 to 37 of them
+per worker. **That is PM2 polling whether the pid has gone, not a repeated
+signal and not a failed kill**, and the line to read is the one immediately
+after them: `exited with code [0] via signal [SIGINT]`, which is the clean
+case. A signal genuinely delivered twice would leave its trace in the
+*service's* log instead, as the `debug`-level record
+`Signal ignored; a drain is already under way` — and that record does not
+appear during a reload, because the application receives exactly one signal.
+The reproduction and the counting command are in
+[section 11](#11-troubleshooting).
+
 ### Reload versus scale
 
 **Reload applies code and environment changes. Scale changes how many workers
@@ -745,6 +927,34 @@ run.** They are not interchangeable, and the failure mode is quiet.
 process name, and passes `--update-env`, so changed field and environment
 values are re-read from `ecosystem.config.js` on every deploy instead of from
 PM2's already-registered definition.
+
+**One thing `--update-env` does not do: remove an environment key you deleted
+from the descriptor.** Verified with PM2 7.0.4. Adding a key to the `env`
+block reaches the new workers, and changing a key's value propagates — but
+deleting the key does not take it away. PM2 re-reads the block, so its record
+of the block itself loses the key, while the flattened copy the daemon keeps
+for the application survives and is still injected into **brand-new** workers.
+A worker started by that reload therefore still carries the old value, and any
+`.env` entry the key was shadowing
+([section 4](#precedence-pm2-beats-env-beats-the-defaults)) is still being
+ignored. The recovery is a re-registration rather than another reload:
+
+```bash
+npm run pm2:delete && npm run pm2:start   # the key is gone from the workers
+pm2 save                                  # a new registration; persist it
+pm2 env <id>                              # confirm what a worker carries
+```
+
+`pm2 env <id>`, with the id from `npm run pm2:status`, is the check that
+settles it: it prints what PM2 injects, rather than what the descriptor now
+says it should inject — and for a key that came from the `env` block, what PM2
+injects is exactly what the worker carries. It is not the worker's whole
+environment: values that reach the process from `server/.env` are loaded by
+`dotenv` inside the process and never appear here, so `PORT` being absent from
+this output while the service is plainly bound to it is correct rather than a
+discrepancy. The `pm2 save` is required for the reason in
+[what needs a `pm2 save`](#what-needs-a-pm2-save-and-what-does-not) — delete
+and re-register rewrites the registration the saved snapshot describes.
 
 But reload does **not** reconcile the worker count. Verified with PM2 7.0.4:
 raising `instances` from 2 to 3 and reloading reloads the two registered
@@ -759,6 +969,30 @@ pm2 save                   # persist the new worker count for resurrection
 # or, equivalently:
 npm run pm2:delete && npm run pm2:start && pm2 save
 ```
+
+> **`<n>` must be at least 1, and `-- 0` is not a stop.** Verified with PM2
+> 7.0.4: `npm run pm2:scale -- 0` exits **`0`** while **deleting the
+> application from PM2 entirely** — both workers removed, no row left in
+> `pm2 status`, the port free and every request refused. And the obvious
+> recovery does not work, because there is no longer an application of that
+> name to scale: `npm run pm2:scale -- 2` fails with
+> `[PM2][ERROR] Application hello-world-service not found`. Two commands do
+> recover it, and both were verified:
+>
+> ```bash
+> npm run pm2:start    # re-register and start from the descriptor
+> npm run pm2:reload   # also works: warns "Applications hello-world-service
+>                      # not running, starting…", honours wait_ready, and
+>                      # brings both instances up from the descriptor
+> pm2 save             # either way the registration is new — persist it
+> ```
+>
+> Follow either with `pm2 save`, for the reason in
+> [what needs a `pm2 save`](#what-needs-a-pm2-save-and-what-does-not): the
+> registration is new, and an unsaved one is not what a reboot restores. **To
+> stop serving without deregistering, use `npm run pm2:stop`** — it leaves the
+> application in the registry, which is what keeps the saved snapshot accurate
+> and lets `npm run pm2:start` bring it back.
 
 ### What needs a `pm2 save`, and what does not
 
@@ -858,6 +1092,53 @@ supervisor: a cgroup or `systemd` unit limit (`MemoryMax=`), or a container
 memory limit. Set that as well as, not instead of, this field — the OS limit
 caps the damage, while `max_memory_restart` is what turns a leak into a
 recorded restart you can go and look at.
+
+**The heap half of the same budget: `node_args: ['--max-old-space-size=192']`.**
+A restart threshold on its own has nothing on the other side of it. Node sizes
+V8's heap from **host** memory unless it is told otherwise, and on the host
+these figures were measured on that is a `heap_size_limit` of **4288 MiB —
+16.7 times the 256 MB threshold** — so V8 has no reason to collect anywhere
+near the threshold, and whatever headroom the service keeps under load is a
+property of how much memory the host has rather than of anything the
+descriptor says. The descriptor therefore declares the heap figure as well:
+192 MB of old space, which Node 24.20.0 reports as a `heap_size_limit` of
+384 MiB once the other heap spaces are counted.
+
+What that changed under sustained large-body `POST /api/v1/echo` load is
+below, and **the two resident-memory sources disagree materially, so both are
+quoted** — PM2 samples its own figure and compares *that* against
+`max_memory_restart`, while `VmRSS` is what `ps` and `/proc` report to an
+operator:
+
+| Heap sizing | PM2's sampled figure | `VmRSS` (`ps`, `/proc`) |
+|---|---|---|
+| Host-derived, no `node_args` | 168.1 MiB — 65.7% of the threshold | 239.8 MiB — **93.7%**, i.e. 6.3% of headroom left |
+| Declared, `--max-old-space-size=192` | 134.3 MiB — 52.5% | 155.3 MiB — 60.7% |
+
+The shape changed as well as the figure: with the heap declared, resident
+memory reached a **flat plateau** and stayed there across twelve equal request
+batches and across idle, instead of still stepping upward while the load
+continued. Both runs served every request correctly.
+
+**This is not a cap on the process, and the paragraphs above still apply.**
+Resident memory is the heap *plus* external buffers *plus* native allocation,
+so the flag bounds the dominant term and not the total: `max_memory_restart`
+remains the safety net, and an OS-level limit remains the only figure that
+cannot be overshot. Nor is the plateau a guarantee — it is what this workload
+measured on one host, and a different body size, concurrency or host will move
+it. The flag also binds **only the workers PM2 launches**: `npm start` and
+`npm run dev` read no descriptor at all and get the host-derived heap.
+
+**So the two fields move together.** They are one budget in two halves, like
+`SHUTDOWN_TIMEOUT_MS` and `kill_timeout`: change either and re-check the
+other, and keep **the figure in the flag** — the `192`, not the 384 MiB
+`heap_size_limit` V8 derives from it — below the restart threshold. Raise it
+past the threshold and the threshold stops being a safety net and becomes an
+operational trigger: ordinary steady-state growth ends up on the wrong side of
+it, and PM2 restarts workers that are doing nothing wrong. Neither number is
+the one PM2 compares, which is worth keeping straight — PM2 measures
+**resident** memory, and the flag's contribution is to bound the largest part
+of it.
 
 
 ## 8. Host prerequisites — four required steps
@@ -1483,6 +1764,35 @@ Service records other than the configuration-failure one appearing in
 `error.log` mean the logger's stream configuration has changed, not that the
 service is failing.
 
+**That holds even for the one failure the service cannot answer, and it takes a
+deliberate choice to keep it true.** If a request fails *after* its response
+has already begun — a handler that has written its status and some body and
+then fails inside the request cycle — the response cannot be replaced by the
+error envelope, because the status and the bytes are already on the wire. What
+the service does instead is write the ordinary exception record to stdout and
+then **destroy the connection**, so a half-written response is cut short rather
+than left looking like a complete one. Express's own default
+handler would have ended the connection the same way, but only after printing
+the raw multi-line stack to standard error — which would put an unparseable,
+unbounded and *unscrubbed* block into `error.log`, bypassing the redaction that
+keeps credentials out of the log. The service therefore closes the connection
+itself, and `error.log` stays empty. Diagnose this case from the `level: 50`
+record on stdout, which carries the request id, the real message and the
+bounded, scrubbed stack.
+
+The visible symptoms are worth recognising, because the request looks
+successful from the status alone. What the caller sees depends on how far the
+response had got: a handler that had written only part of its body leaves the
+exchange cut short — `curl` reports an empty reply or a truncated transfer
+depending on how much had already reached the client — while a handler that had
+*completed* its response and then failed afterwards leaves that response
+delivered intact, with only the connection closed behind it. In the logs both
+look the same: the access record for that request id shows the status the
+handler had already sent, commonly `200` at level `30`, paired with an
+exception record at level `50` saying the request failed. **Two records
+disagreeing about one request id is the signature of this case**, and it always
+means a bug in a handler rather than a bad request.
+
 **`time: false` in the descriptor is deliberate.** PM2's `time: true` would
 prefix every captured line with a human-readable timestamp, and that prefix
 sits *outside* the JSON object — so each line stops being valid JSON and
@@ -1530,7 +1840,7 @@ plain integers and the process figures are read from `process` at render time:
 | `http_requests_by_status_class_total` | counter | Responses that **completed**, by status class, labelled `status_class="1xx"` … `"5xx"`; a request the client abandoned mid-response completes nothing and so lands in no bucket |
 | `http_requests_in_flight` | gauge | Requests currently being handled by this worker |
 | `process_uptime_seconds` | gauge | Seconds since this worker started |
-| `process_resident_memory_bytes` | gauge | Resident set size of this worker |
+| `process_resident_memory_bytes` | gauge | Resident set size of this worker — libuv's coarse figure, which reads materially **lower** than `ps`/`VmRSS` and can sit frozen while real memory grows; before you alert on it read [what the resident-memory gauge does and does not measure](#what-the-resident-memory-gauge-does-and-does-not-measure) |
 | `process_cpu_seconds_total` | counter | User plus system CPU time consumed by this worker |
 
 No sample carries an identity label. The only label anywhere in the
@@ -1603,6 +1913,75 @@ ordinary follow-on work with this endpoint already in place.
 file, no test runner and no `test` script, so the lifecycle, error-mapping and
 configuration behaviour described in this document has no automated guard, and
 a future change can break it silently.
+
+### What the resident-memory gauge does and does not measure
+
+`process_resident_memory_bytes` is `process.memoryUsage().rss`, which is
+libuv's `uv_resident_set_memory()` — **field 24 of `/proc/<pid>/stat`
+multiplied by the page size**. That is not the number `ps` prints. The kernel
+serves that field from batched per-CPU counters, so it lags, and it moves only
+in whole page-count quanta — **1.5 MiB steps** on this kernel — while
+`/proc/<pid>/status` `VmRSS`, the figure behind `ps -o rss=` and
+`smaps_rollup`, tracks each allocation as it happens.
+
+Measured on a production worker: the gauge read **66,658,304 B on five
+consecutive scrapes, byte for byte**, and was still exactly that after ~500
+seconds of process life and 60 × 2 KB `POST /api/v1/echo` round trips — while
+across the same window `VmRSS` rose 75,689,984 → 75,927,552 B and `ps -o rss=`
+rose 73,716 → 73,912 KiB. The gauge sat **11.9 % below** the OS figure and did
+not move at all while the OS figure did.
+
+That leaves the gauge good for two things and unfit for a third:
+
+- **A rough per-worker trend** over minutes to hours. Over that span the
+  quantisation washes out and the direction is real.
+- **Reasoning about `max_memory_restart`**, because PM2 reads the same
+  `/proc/<pid>/stat` field this gauge does — see the sizing note below.
+- **Not** an input to a container-limit or memory-growth alert. A leak can
+  advance by megabytes with this number frozen, and a cgroup or container
+  limit is enforced against `VmRSS`-class accounting rather than against this
+  field. Alert on `VmRSS`, on `ps -o rss=`, or on the cgroup's own
+  `memory.current`.
+
+**Cross-check a live worker** — substitute its pid, which
+`npm run pm2:status` prints and every log line carries as `pid`:
+
+```bash
+PID=1234
+curl -s http://localhost:3000/metrics \
+  | awk '/^process_resident_memory_bytes /{print "metric   " $2 " B"}'
+awk '/^VmRSS:/{print "VmRSS    " $2*1024 " B"}' /proc/$PID/status
+echo "ps       $(( $(ps -o rss= -p $PID) * 1024 )) B"
+awk -v p="$(getconf PAGESIZE)" '{print "stat[24] " $24*p " B"}' /proc/$PID/stat
+```
+
+`metric` and `stat[24]` will agree **exactly**; `VmRSS` and `ps` will agree
+with each other and read **higher**. That is the expected outcome, not a
+fault. The reading that would mean something is wrong is `metric` above
+`VmRSS`.
+
+The source is **deliberately unchanged**. `process.memoryUsage()` is what this
+service is specified to report, and `process.memoryUsage.rss()` is not an
+accuracy improvement: it returns the identical libuv figure — identical on 12
+of 12 samples taken in both call orders on this host — so it is a cheaper call
+on the same number, not a truer one.
+
+**Sizing note, and it matters the moment you read `ps` next to
+`max_memory_restart`.** Under sustained large-body load the two sources
+diverge much further than the 11.9 % above. One worker plateaued at **168.1
+MiB on the `/proc/<pid>/stat` source — 65.7 % of the descriptor's 256 MiB
+`max_memory_restart` ceiling — while the `VmRSS`/`ps` source read 239.8 MiB,
+or 93.7 % of that same ceiling**: a ~70 MiB disagreement about one worker at
+one instant. **PM2 compares against the lower of the two.** Its `pidusage`
+dependency computes resident memory as `infos[21] * pageSize` in
+`pm2/node_modules/pidusage/lib/procfile.js`, and that index is
+`/proc/<pid>/stat` field 24 again — the same field as the gauge. So an
+operator watching `ps` sees a worker that looks far closer to being recycled
+than the figure PM2 actually acts on: size the host against the `ps` number,
+and expect the restart decision to be taken on the lower one. The threshold is
+also polled rather than hard, which compounds the same gap —
+[Why `instances: 2` and not `'max'`](#why-instances-2-and-not-max) has that
+part.
 
 ## 11. Troubleshooting
 
@@ -1776,6 +2155,64 @@ per-handler deadlines and cancellation are.
 
 Reload does not reconcile `instances`; use `npm run pm2:scale -- <n>`. See
 [reload versus scale](#reload-versus-scale).
+
+### The application is gone from `pm2 status` and scale says it is not found
+
+Something scaled it to zero. `npm run pm2:scale -- 0` is not a stop: it exits
+`0` and **deletes the application from PM2**, so no row remains in
+`pm2 status`, the port is free, and requests are refused rather than answered.
+Scaling back up cannot help, because there is no registration left to scale —
+`npm run pm2:scale -- 2` reports
+`[PM2][ERROR] Application hello-world-service not found`. Re-register it
+instead:
+
+```bash
+npm run pm2:start          # re-register and start from the descriptor
+# or:
+npm run pm2:reload         # starts an unregistered application, warning first
+pm2 save                   # the registration is new; without this, a reboot
+                           # restores the previous snapshot
+```
+
+The distinction worth remembering afterwards: `npm run pm2:stop` stops serving
+and **leaves the application registered**, which is what an operator almost
+always wants; `pm2:delete` and `pm2:scale -- 0` deregister it. See
+[reload versus scale](#reload-versus-scale) and
+[what needs a `pm2 save`](#what-needs-a-pm2-save-and-what-does-not).
+
+### PM2's daemon log says `failed to kill - retrying in 100ms`
+
+It describes a **successful** drain, not a failed one, and every clean deploy
+produces it:
+
+```bash
+grep -c "failed to kill" "${PM2_HOME:-$HOME/.pm2}/pm2.log"
+```
+
+Expect 15 to 37 of these lines **per retiring worker** — PM2 emits one every
+100 ms for as long as that worker's drain lasts, so a drain that finishes an
+in-flight request produces more of them than an idle one, and a reload of two
+workers produces two such runs. They are PM2 polling whether the pid has gone.
+They are **not** repeated signals: the application receives exactly one, and
+nothing in the service reacts to them.
+
+Read the lines around them instead. `exited with code [0] via signal [SIGINT]`
+immediately afterwards is the clean case. `code [1]`, together with
+`Drain budget exhausted; forcing exit` in the service's own log, is the forced
+case — see
+[a slow request was cut off during a deploy](#a-slow-request-was-cut-off-during-a-deploy).
+And if you need to rule out a repeated signal, the evidence is in the
+service's log rather than the daemon's: a second signal is recorded at `debug`
+level as `Signal ignored; a drain is already under way`
+([a shutdown looks like it happened twice](#a-shutdown-looks-like-it-happened-twice)),
+and it does not appear during a PM2 reload.
+
+All of this is in PM2's own daemon log, `$PM2_HOME/pm2.log`, which is a third
+file beside the application's own two: `npm run pm2:logs` filters to
+`logs/out.log` and `logs/error.log` ([section 9](#9-reading-the-logs)), so the
+daemon's records need `pm2 logs PM2` instead.
+[Section 8.2](#82-configure-log-retention) covers rotating this file as well
+as the other two.
 
 ### A reload takes seconds — is that the handshake failing?
 

@@ -13,6 +13,16 @@
 
 const HttpError = require('../lib/http-error');
 
+// The path policy this service already applies to what it logs, reused here for
+// what it SAYS. `./request-context.js` exports `serializePath` as a named
+// property on its middleware export precisely so this file can share the one
+// implementation instead of restating its 512-char bound and its
+// `... (truncated)` marker -- a copy of either would let the message and the
+// access record for the same request disagree. No cycle: request-context
+// requires only pino-http, node:crypto, ../lib/logger and ../lib/metrics, and
+// nothing in that set reaches back here.
+const { serializePath } = require('./request-context');
+
 /**
  * Terminal 404 producer for the request pipeline.
  *
@@ -23,6 +33,12 @@ const HttpError = require('../lib/http-error');
  * always delegates, every invocation ending in `next(err)`, which keeps
  * `error-handler.js` the single exit for the 404 path exactly as it is for
  * every other failure.
+ *
+ * The message it carries names the method and the request's PATHNAME, reduced
+ * by `./request-context.js`'s `serializePath` -- query string and fragment
+ * removed, bounded at 512 characters with an explicit `... (truncated)` marker
+ * -- so the value reflected to the caller is the same value this service
+ * permits itself to log.
  *
  * @param {import('express').Request} req The unhandled request; `method` and
  *   `originalUrl` are read from it to describe the failure.
@@ -40,7 +56,18 @@ function notFound(req, res, next) {
   // point of a router mounted under a prefix, so `url` can name a path the
   // client never sent. `originalUrl` is the URL as it arrived, which is the
   // only form worth reporting back or correlating with an access record.
-  const message = `Cannot ${req.method} ${req.originalUrl}`;
+  //
+  // PUT THROUGH `serializePath` RATHER THAN INTERPOLATED RAW, on three counts.
+  // The contract is a 404 naming the method and the PATH, while `originalUrl`
+  // is path PLUS query string, so the raw value says more than was specified.
+  // A response body is captured by proxies, CDNs and APM agents as freely as a
+  // log stream is shipped and retained, so a value this service deliberately
+  // keeps out of its own records -- a `?access_token=...`, a signed URL's
+  // signature -- must not be handed to the caller instead; keeping it out of
+  // one and reflecting it from the other guards nothing. And the bound decides
+  // WHO sizes this string: unbounded, a caller picks it, and a request-line-
+  // sized path becomes a same-sized message in every 404 body.
+  const message = `Cannot ${req.method} ${serializePath(req.originalUrl)}`;
 
   // An error rather than a response, and the indirection is the point:
   // error-handler.js formats it into the one

@@ -43,7 +43,15 @@ package-lock.json
 /.mvn/extensions.xml
 # Node.js service (server/)
 
-.env
-.env.local
+# Every .env-named variant, not only the two names the service reads: the
+# character classes cover case variants (.ENV) because git matches these
+# patterns case-sensitively, and the trailing wildcard covers the suffixed
+# conventions (.env.local, .env.production) an operator creates beside .env.
+.[Ee][Nn][Vv]*
+# ...except the committed template, re-included after the rule it overrides
+# because a negation only applies to a preceding rule, and path-qualified so
+# no other .env.example is re-included. A further committed template needs
+# its own negation line here.
+!server/.env.example
 server/logs/
 !server/package-lock.json

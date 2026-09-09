@@ -99,6 +99,20 @@ const router = express.Router();
  * Both probe responses go through this one function so that the two contracts
  * cannot drift apart, and so the reasoning above is recorded once.
  *
+ * WHAT A `HEAD` PROBE GETS FROM HERE. Both routes below are `GET` routes and
+ * neither declares a `HEAD` handler, so the router package answers `HEAD` from
+ * them and this function writes the answer unchanged: the same status -- `200`
+ * or the draining `503` -- and the same three headers, with Node suppressing
+ * the JSON body because the response is to a `HEAD` request. `Content-Length`
+ * stays on that empty answer and still describes the body a `GET` would
+ * return, which is what RFC 9110 asks of a `HEAD` response. The consequence
+ * worth knowing is operational: a monitor or proxy that probes with `HEAD`
+ * reads the readiness state correctly from the status line alone, so the
+ * `503` this function writes during a drain is as visible to a `HEAD` check as
+ * to a `GET` one. Do not add a `HEAD` handler to obtain that -- it is already
+ * the behaviour, and a second handler would be a second contract to keep in
+ * step with this one.
+ *
  * @param {import('express').Response} res The response to write.
  * @param {number} status The HTTP status to send: `200` or `503`.
  * @param {object} payload The flat probe object to serialize. Key insertion

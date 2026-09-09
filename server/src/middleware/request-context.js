@@ -5,9 +5,11 @@
  * Single responsibility: establish the observability context of a request --
  * one job stated three ways. Request IDENTITY (`req.id` plus the
  * `x-request-id` response header), the ACCESS RECORD (exactly one structured
- * line per request, with a child logger on `req.log`), and the request
- * COUNTERS in `../lib/metrics`, of which this module is the sole writer. It
- * formats no response, resolves no route and reads no configuration.
+ * line per request, with a child logger on `req.log`, and the serializers
+ * deciding what that line may say about the request and the response), and the
+ * request COUNTERS in `../lib/metrics`, of which this module is the sole
+ * writer. It formats no response, resolves no route and reads no
+ * configuration.
  *
  * POSITION 1 OF 8, AND IT MUST BE FIRST. The pipeline `src/app.js` owns is:
  * 1 requestContext -> 2 helmet() -> 3 compression() -> 4 express.json() ->
@@ -26,9 +28,6 @@
 
 'use strict';
 
-// The access-log middleware factory, a declared dependency at 11.0.0. It owns
-// the per-request child logger and the single completion record; this file owns
-// only the three hooks handed to it below.
 const pinoHttp = require('pino-http');
 
 // The id generator, from a Node built-in. The `node:` prefix cannot resolve to
@@ -75,6 +74,50 @@ const CLIENT_ERROR_STATUS = 400;
 const LEVEL_ERROR = 'error';
 const LEVEL_WARN = 'warn';
 const LEVEL_INFO = 'info';
+
+/**
+ * Longest request path written to a record. A path is the resource identifier
+ * and is kept whole in normal traffic; the bound exists because its length is
+ * the caller's choice, and an unbounded value in a field written once per
+ * request is an unbounded log line.
+ * @type {number}
+ */
+const MAX_LOGGED_PATH_LENGTH = 512;
+
+/**
+ * The only request headers written to a record, and the list is a contract
+ * rather than a convenience.
+ *
+ * WHY AN ALLOWLIST RATHER THAN THE FULL HEADER MAP. pino's default request
+ * serializer writes EVERY inbound header, which puts two different problems in
+ * every access record: a header nobody vetted can carry a credential or a
+ * personal identifier, and `X-Forwarded-For` / `X-Forwarded-Proto` are
+ * caller-supplied strings that are only meaningful behind a proxy that
+ * overwrites them -- written raw, a forged value reads in the log exactly like
+ * a real one. The trust-aware `ip` and `protocol` fields below are where the
+ * client's address and scheme come from instead, which is what makes
+ * `TRUST_PROXY` govern the logged identity.
+ *
+ * `authorization` and `cookie` are on the list DELIBERATELY, and dropping them
+ * would be the wrong kind of tidy: the root logger redacts exactly those two
+ * paths (`req.headers.authorization`, `req.headers.cookie`), so what reaches
+ * the stream is the key with `[Redacted]` in place of the value -- which
+ * records that the request carried a credential, the one fact worth having,
+ * without carrying the credential. Their values never appear in clear text.
+ *
+ * Everything else is excluded on purpose, including `referer` (which routinely
+ * carries another URL's query string) and `x-request-id` (already `req.id`).
+ * @type {readonly string[]}
+ */
+const LOGGED_HEADERS = Object.freeze([
+  'host',
+  'user-agent',
+  'content-type',
+  'content-length',
+  'accept-encoding',
+  'authorization',
+  'cookie'
+]);
 
 /**
  * Resolve the request id -- echo a well-formed inbound value, otherwise
@@ -160,18 +203,180 @@ function customLogLevel(req, res, err) {
 }
 
 /**
+ * Reduces a request URL to the path a record may carry: the pathname, bounded.
+ *
+ * WHY THE QUERY STRING IS DROPPED RATHER THAN REDACTED. A query string is
+ * caller-controlled and routinely carries credentials -- `?access_token=...`,
+ * a signed URL's signature, a password-reset token -- and a log stream is
+ * copied, shipped and retained far more freely than the request it describes,
+ * so one such record outlives the credential's usefulness by a long way. There
+ * is no list of parameter names that could make keeping it safe, because the
+ * names are the caller's to choose. The pathname is what identifies the
+ * resource, and it is all this service needs to explain its own traffic.
+ *
+ * @param {*} url The URL as pino's request serializer resolved it -- Express's
+ *   `originalUrl`, so a router mounted under a prefix still reports the path
+ *   the client actually sent.
+ * @returns {string} The pathname, truncated with an explicit marker beyond
+ *   `MAX_LOGGED_PATH_LENGTH`, or the empty string when there is no URL to
+ *   reduce -- the field is always present, so the record's shape never varies.
+ */
+function serializePath(url) {
+  if (typeof url !== 'string' || url.length === 0) {
+    return '';
+  }
+
+  // The first `?` or `#`, whichever comes first, ends the pathname. A fragment
+  // is not supposed to reach a server at all, so its presence is a sign of a
+  // hand-built request rather than a browser's -- which is reason enough not to
+  // write whatever follows it.
+  const queryIndex = url.indexOf('?');
+  const fragmentIndex = url.indexOf('#');
+  let end = queryIndex === -1 ? url.length : queryIndex;
+
+  if (fragmentIndex !== -1 && fragmentIndex < end) {
+    end = fragmentIndex;
+  }
+
+  const pathname = url.slice(0, end);
+
+  return pathname.length > MAX_LOGGED_PATH_LENGTH
+    ? `${pathname.slice(0, MAX_LOGGED_PATH_LENGTH)}... (truncated)`
+    : pathname;
+}
+
+/**
+ * The request serializer for the access record: what may be written about an
+ * inbound request, in place of pino's default "write everything".
+ *
+ * WHY THIS EXISTS, IN TWO PARTS. pino's default request serializer writes the
+ * full URL including its query string, the parsed query object, and every
+ * inbound header -- so `GET /health?access_token=live-secret` puts a live
+ * credential in the access record, and an `X-Forwarded-For` a client invented
+ * is written as though it were fact. Second, that default derives the client
+ * address from the socket (`remoteAddress`) and records no scheme at all, so
+ * `TRUST_PROXY` -- which governs Express's own `req.ip` and `req.protocol` --
+ * would have no effect whatsoever on the logged identity. The comments in
+ * `src/config/index.js` and `src/app.js` describing what that setting protects
+ * are true because this serializer records those two fields.
+ *
+ * WHY IT IS CONFIGURED HERE RATHER THAN ON THE ROOT LOGGER. pino-http installs
+ * its own `req` and `res` serializers on the child logger it derives, which
+ * shadow anything the root declares for those two keys, so this is the only
+ * place a request serializer takes effect for the access record. The root
+ * keeps the redaction policy -- which still applies here, and is what turns
+ * the two credential headers below into `[Redacted]`.
+ *
+ * @param {object} request The request as pino's DEFAULT serializer already
+ *   reduced it -- pino-http wraps a custom serializer around that one, so the
+ *   argument carries `id`, `method`, `url`, `query`, `params`, `headers`,
+ *   `remoteAddress`, `remotePort`, plus a non-enumerable `raw` referring to the
+ *   Express request itself. Only `id`, `method`, `url` and `raw` are read.
+ * @returns {{ id: *, method: *, path: string, ip: *, protocol: string,
+ *   headers: Record<string, string> }} The permitted fields, and no others:
+ *   the request id, the method, the bounded pathname, the trust-aware client
+ *   address and scheme, and the allowlisted headers.
+ */
+function serializeRequest(request) {
+  // `raw` is the Express request, and it is what makes `ip` and `protocol`
+  // trust-aware: both are Express getters that consult the application's
+  // `trust proxy` setting. Falling back to the serialized object keeps this
+  // function total if it is ever handed something without a `raw`.
+  const raw =
+    request.raw === null || request.raw === undefined ? request : request.raw;
+
+  const inbound =
+    raw.headers === null || typeof raw.headers !== 'object'
+      ? request.headers
+      : raw.headers;
+
+  const headers = {};
+
+  if (inbound !== null && typeof inbound === 'object') {
+    for (const name of LOGGED_HEADERS) {
+      const value = inbound[name];
+
+      // A string test rather than a truthiness test: a duplicated header
+      // arrives comma-joined (still a string, and still worth recording),
+      // while an absent one is `undefined` and is left out entirely rather
+      // than written as null.
+      if (typeof value === 'string') {
+        headers[name] = value;
+      }
+    }
+  }
+
+  // The scheme, resolved before the record is assembled so the fallback is
+  // readable. `raw.protocol` is Express's trust-aware value -- `http` unless a
+  // proxy this service has been told to trust declared otherwise -- and the
+  // socket's own encryption state is what the answer would be if Express were
+  // not in the path at all.
+  let protocol = 'http';
+
+  if (typeof raw.protocol === 'string') {
+    protocol = raw.protocol;
+  } else if (
+    raw.socket !== null &&
+    typeof raw.socket === 'object' &&
+    raw.socket.encrypted === true
+  ) {
+    protocol = 'https';
+  }
+
+  return {
+    id: request.id,
+    method: request.method,
+    path: serializePath(request.url),
+    // `raw.ip` is Express's trust-aware address: the socket's peer while
+    // `TRUST_PROXY` is `false`, and the left-most address the trusted proxy
+    // chain vouches for once it is `true`. The socket address is the fallback
+    // for a request that never passed through Express.
+    ip: typeof raw.ip === 'string' ? raw.ip : request.remoteAddress,
+    protocol,
+    headers
+  };
+}
+
+/**
+ * The response serializer for the access record: the status, and nothing else.
+ *
+ * pino's default also writes every response header, which serves no purpose
+ * here and carries real risk: `Set-Cookie` is a credential, and the rest are
+ * this service's own fixed security headers, identical on every response and
+ * therefore pure repetition in a stream someone pays to retain. The status is
+ * the outcome the record is about, and `responseTime` -- which pino-http adds
+ * alongside this object -- is the other half of it.
+ *
+ * @param {object} response The response as pino's default serializer reduced
+ *   it; only `statusCode` is read.
+ * @returns {{ statusCode: * }} The status the response completed with.
+ */
+function serializeResponse(response) {
+  return { statusCode: response.statusCode };
+}
+
+/**
  * The pino-http instance, built ONCE at module scope -- nothing in its
  * configuration depends on a request, so per-request construction would create
  * a fresh hook set and child-logger chain for no gain.
  *
- * WHY THE SHARED LOGGER IS PASSED IN AND NOTHING ELSE IS RESTATED:
+ * WHY THE SHARED LOGGER IS PASSED IN AND ALMOST NOTHING IS RESTATED:
  * `../lib/logger` already owns `level` (from configuration), `base`
- * (`{ pid, instance, service }`) and `redact` (`req.headers.authorization`,
- * `req.headers.cookie`). Handing over the instance is what applies all three to
- * every access record and to the `req.log` child derived from it. Re-declaring
- * `level`, `base`, `redact`, `transport` or `serializers` here would put the
- * redaction policy in two files, and that duplication does not fail loudly --
- * one copy drifts and starts logging an `Authorization` header in clear text.
+ * (`{ pid, instance, service }`), `redact` (`req.headers.authorization`,
+ * `req.headers.cookie`), the `err` allowlist and the string bound and scrub.
+ * Handing over the instance is what applies all of them to every access record
+ * and to the `req.log` child derived from it. Re-declaring `level`, `base`,
+ * `redact` or `transport` here would put one policy in two files, and that
+ * duplication does not fail loudly -- one copy drifts and starts logging an
+ * `Authorization` header in clear text.
+ *
+ * THE ONE EXCEPTION IS `serializers`, AND IT HAS TO BE HERE. pino-http
+ * installs its own `req` and `res` serializers on the child it derives, which
+ * shadow whatever the root declares for those two keys -- so a request
+ * serializer set on the root would look authoritative and govern nothing.
+ * `err` is deliberately absent from this object: the root's allowlist reaches
+ * the access record through the inherited log formatter, and naming it again
+ * here would be the duplication the paragraph above warns about.
  *
  * Three options are absent on purpose, each because setting it would break the
  * one-record-per-request guarantee or fail outright:
@@ -188,7 +393,12 @@ function customLogLevel(req, res, err) {
  *
  * @type {import('pino-http').HttpLogger}
  */
-const httpLogger = pinoHttp({ logger, genReqId, customLogLevel });
+const httpLogger = pinoHttp({
+  logger,
+  genReqId,
+  customLogLevel,
+  serializers: { req: serializeRequest, res: serializeResponse }
+});
 
 /**
  * Position 1 of 8 in the request pipeline: the FIRST middleware registered by
@@ -200,11 +410,13 @@ const httpLogger = pinoHttp({ logger, genReqId, customLogLevel });
  *   * attaches a per-request child logger to `req.log`, inheriting the root
  *     logger's level, identity fields and redaction policy;
  *   * guarantees exactly ONE access record, emitted on response completion at
- *     the level `customLogLevel()` chooses;
+ *     the level `customLogLevel()` chooses, carrying the request id, method,
+ *     pathname, trust-aware client address and scheme, allowlisted headers,
+ *     status and response time -- and no query string, no forwarded header and
+ *     no response header;
  *   * writes the request counters, of which it is the sole writer, pairing
- *     every accepted request with exactly one finish -- supplying the response
- *     status for the status-class bucket only when the response actually
- *     completed, so an aborted connection is not tallied as a success.
+ *     every accepted request with exactly one finish carrying the status the
+ *     response held when it closed.
  *
  * It never sends a response, never inspects a route and always delegates.
  *
@@ -217,9 +429,6 @@ const httpLogger = pinoHttp({ logger, genReqId, customLogLevel });
  *   result, which is how control reaches `next()`.
  */
 function requestContext(req, res, next) {
-  // Counted as accepted here, before anything can reject it, for the same
-  // reason this middleware sits at position 1: a body-parse failure and a 404
-  // are both requests the service handled and must appear in the totals.
   recordRequestStart();
 
   /*
@@ -266,40 +475,14 @@ function requestContext(req, res, next) {
     }
     counted = true;
 
-    // A STATUS ONLY FOR A RESPONSE THAT ACTUALLY COMPLETED, and this gate is
-    // the whole reason the `'close'` event can serve both outcomes.
-    //
-    // `'close'` fires for a completed response AND for a connection the client
-    // destroyed mid-flight, which is what makes the pairing above correct --
-    // but the two cases carry very different status codes. On a completed
-    // response `res.statusCode` is the final status the client saw, exactly
-    // what the per-class bucket needs. On an abort it is whatever the value
-    // happened to be when the socket died, and if the handler had not responded
-    // yet, that is Node's UNTOUCHED DEFAULT OF 200 -- so passing it
-    // unconditionally files abandoned requests in the `2xx` bucket and reports
-    // dropped traffic as success.
-    //
-    // `res.writableFinished` is the discriminator: it turns true only once the
-    // response has been fully flushed to the socket, so it is precisely the
-    // "completed" that `http_requests_by_status_class_total` claims to count.
-    // `undefined` is the store's documented abort signal -- it lowers the
-    // in-flight gauge and tallies no bucket. Note the deliberate boundary: a
-    // client that aborts after the headers were sent but before the body
-    // finished is also counted as not completed, even though a status did reach
-    // it. That is the honest reading of "completed", and it keeps this gate a
-    // single unambiguous test rather than a guess about how much of the
-    // response the client actually received.
-    recordRequestEnd(res.writableFinished ? res.statusCode : undefined);
+    // Exactly one end for every start, including for a request the client
+    // aborts: Node emits `'close'` once whether the response completed or the
+    // connection was destroyed first. The status passed is `res.statusCode`,
+    // the status the response carried at the moment it closed.
+    recordRequestEnd(res.statusCode);
   });
 
-  // Delegate last, so identity and counting are established for the request
-  // before pino-http calls `next()`.
   return httpLogger(req, res, next);
 }
 
-// Assigned directly, not wrapped: `src/app.js` hands this value straight to
-// `app.use()`, so exporting `{ requestContext }` would register an object where
-// a handler belongs. A factory would be equally wrong -- there is one pipeline
-// and one pino-http instance per process, and both exist by the time this line
-// runs.
 module.exports = requestContext;

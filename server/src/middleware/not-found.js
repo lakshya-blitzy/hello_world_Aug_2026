@@ -1,38 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Single responsibility: turn a request that matched no route into a typed 404
-// error and hand it to the error handler. Nothing else.
+// Single responsibility: turn a request no route handled -- an unmatched path,
+// or a method the router tree's gate does not admit -- into a typed 404 error
+// and hand it to the error handler. Nothing else.
 //
-// Position 7 of 8 in the pipeline src/app.js owns -- after the mounted router
-// tree and any `options.extraRouters`, immediately before the four-arity error
-// handler. Being reached is itself the proof that nothing matched, so there is
-// no condition to test here. app.js registers this module; it must never
-// require app.js in return, an edge that would close a cycle onto its mounter.
+// Position 7 of 8 in the pipeline src/app.js owns. Being reached is itself the
+// proof that nothing handled the request, so there is no condition to test
+// here. app.js registers this module; it must never require app.js in return,
+// an edge that would close a cycle onto its mounter.
 
 'use strict';
 
-// The service's own typed error, and the only dependency here. Deliberately not
-// the similarly named `http-errors` npm package: express depends on it, so it
-// would resolve from this tree today, yet it is absent from server/package.json
-// and would break the moment hoisting changed.
 const HttpError = require('../lib/http-error');
 
 /**
  * Terminal 404 producer for the request pipeline.
  *
  * Runs at position 7 of 8 -- after the router tree and `options.extraRouters`,
- * before the error handler -- so every request it sees is one no route matched.
- * Contract: it never sends a response and always delegates, every invocation
- * ending in `next(err)`, which keeps `error-handler.js` the single exit for the
- * 404 path exactly as it is for every other failure.
+ * before the error handler -- so every request it sees is one nothing handled:
+ * either no route matched the path, or the router tree's method gate refused
+ * the method and skipped its mounts. Contract: it never sends a response and
+ * always delegates, every invocation ending in `next(err)`, which keeps
+ * `error-handler.js` the single exit for the 404 path exactly as it is for
+ * every other failure.
  *
- * @param {express.Request} req The unmatched request; `method` and
+ * @param {import('express').Request} req The unhandled request; `method` and
  *   `originalUrl` are read from it to describe the failure.
- * @param {express.Response} res The response object. Unused on purpose, and it
- *   must stay declared: Express resolves middleware parameters positionally, so
- *   removing it would slide `next` into the `res` slot -- nothing would fail at
- *   load time, and the defect would surface only as a request that never ends.
- * @param {express.NextFunction} next Passes the error to the error handler.
+ * @param {import('express').Response} res The response object. Unused on
+ *   purpose, and it must stay declared: Express resolves middleware parameters
+ *   positionally, so removing it would slide `next` into the `res` slot --
+ *   nothing would fail at load time, and the defect would surface only as a
+ *   request that never ends.
+ * @param {import('express').NextFunction} next Passes the error to the
+ *   error handler.
  * @returns {void} Nothing is returned; the outcome is the delegated error.
  */
 function notFound(req, res, next) {
@@ -50,7 +50,4 @@ function notFound(req, res, next) {
   next(new HttpError(404, message));
 }
 
-// Assigned directly rather than wrapped: app.js pulls this module in as
-// `notFound` and hands it straight to `app.use(notFound)`, so exporting
-// `{ notFound }` would register an object instead of a handler.
 module.exports = notFound;

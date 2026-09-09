@@ -3,7 +3,7 @@
  * The Express application factory for `hello-world-service`.
  *
  * SINGLE RESPONSIBILITY. This module assembles the application and nothing
- * else: the two application settings, the ordered middleware pipeline, and the
+ * else: the application settings, the ordered middleware pipeline, and the
  * mounted router tree. It is the one auditable place where the request
  * pipeline's shape is decided, which is the whole reason it is separate from
  * the process layer.
@@ -46,31 +46,48 @@
  * External dependencies
  *
  * All three are declared runtime dependencies of `server/package.json`
- * (express 5.2.1, helmet 8.3.0, compression 1.8.1). The import surface of this
- * tree is closed: nothing outside that manifest and the Node built-ins may be
- * required, because nothing else will be installed. No logger is built here --
- * pino and pino-http belong to `middleware/request-context.js`, which supplies
- * the access record this file merely positions.
+ * (express 5.2.1, helmet 8.3.0, compression 1.8.1). The SUPPORTED import
+ * surface of this tree is the declared direct dependencies plus the Node
+ * built-ins, and nothing beyond them. An install does put the whole transitive
+ * closure on disk -- `npm ci` resolves 113 packages from seven declared
+ * entries -- so requiring something like `qs` or `bytes` would resolve today;
+ * it is still out of bounds, because it depends on npm's hoisting rather than
+ * on anything the manifest guarantees and can move or vanish on any dependency
+ * bump. No logger is built here -- `pino` belongs to `lib/logger.js` and
+ * `pino-http` to `middleware/request-context.js`, which supplies the access
+ * record this file merely positions.
  * ---------------------------------------------------------------------------
  */
 
-/** The HTTP framework: application object, router, and the body parsers. */
 const express = require('express');
-
-/** Security response headers, applied at pipeline position 2. */
 const helmet = require('helmet');
-
-/** gzip/deflate response compression, applied at pipeline position 3. */
 const compression = require('compression');
 
 /*
  * ---------------------------------------------------------------------------
  * Internal dependencies
  *
- * Every one of these is exported by DIRECT ASSIGNMENT, never wrapped in an
- * object and never as a factory. That is a fixed contract of each module, and
- * destructuring any of them would yield `undefined` and register nothing --
- * a pipeline that silently loses a stage rather than failing at start-up.
+ * Each export shape below is a fixed contract of the module named, and this
+ * file consumes it exactly as it stands:
+ *
+ *   `./config`                     the frozen configuration OBJECT itself, so
+ *                                  its fields are read (or destructured)
+ *                                  directly off the import.
+ *   `./middleware/request-context` a three-arity `(req, res, next)` middleware
+ *   `./middleware/not-found`       function, exported by direct assignment --
+ *                                  no wrapper object, no factory to call.
+ *   `./middleware/error-handler`   the four-arity `(err, req, res, next)`
+ *                                  handler, by direct assignment; its arity is
+ *                                  what makes it an error handler (position 8).
+ *   `./routes`                     one `express.Router()`, by direct
+ *                                  assignment, already carrying every mount.
+ *
+ * Getting one of the four middleware imports wrong -- naming a property the
+ * module does not export, or calling one as a factory -- fails LOUDLY, not
+ * silently: `app.use()` rejects anything that is not a function while the
+ * pipeline is being built, with `TypeError: app.use() requires a middleware
+ * function`, so `createApp()` throws and no partly registered application is
+ * ever handed to a caller or serves a request.
  * ---------------------------------------------------------------------------
  */
 
@@ -83,29 +100,25 @@ const compression = require('compression');
  */
 const config = require('./config');
 
-/** Position 1: pino-http -- request id, access record, metric counters. */
 const requestContext = require('./middleware/request-context');
-
-/** Position 7: turns an unmatched path into a typed 404 error. */
 const notFound = require('./middleware/not-found');
-
-/** Position 8: the four-arity terminal handler, the pipeline's only exit. */
 const errorHandler = require('./middleware/error-handler');
-
-/** Position 6: the aggregated router tree (`/`, `/health`, `/metrics`, `/api/v1`). */
 const routes = require('./routes');
 
 /**
  * Validates the `extraRouters` seam before anything is mounted.
  *
- * WHY VALIDATE AT ALL. Express rejects a non-function passed to `app.use()`,
- * but it reports only that a middleware function was expected -- it cannot say
- * which option or which array index produced it, because by then the value has
- * lost its provenance. Checking here names both, and it fails at construction
- * time rather than on the first request that would have reached the injected
- * route. A non-array is checked separately because `for...of` over a single
- * router -- the most likely mistake, since a Router *is* a function -- throws
- * an opaque "is not iterable" from inside the factory.
+ * WHY VALIDATE AT ALL, GIVEN EXPRESS ALREADY DOES. Express rejects a
+ * non-function passed to `app.use()`, and it does so as the pipeline is built,
+ * so earliness is not what this check buys. It buys the DIAGNOSIS. Express
+ * reports only `TypeError: app.use() requires a middleware function`, naming
+ * neither the option nor the array index that produced the value, because by
+ * then the value has lost its provenance -- and a caller injecting several
+ * routers cannot tell which entry was bad without bisecting its own harness.
+ * This check names `options.extraRouters` and the offending index. A non-array
+ * is rejected separately because `for...of` over a single router -- the most
+ * likely mistake, since a Router *is* a function -- would otherwise throw an
+ * opaque "is not iterable" from inside the factory.
  *
  * @param {unknown} extraRouters The caller-supplied value to check.
  * @returns {void} Returns nothing; the value is unchanged on success.
@@ -134,7 +147,7 @@ function assertMountableRouters(extraRouters) {
   // the pipeline is already assembled, with neither the index nor the option
   // name in the message. Visiting every slot from `0` to `length - 1` reads a
   // hole as the `undefined` it will register as, which is what makes the
-  // fail-early contract above true. Do not "modernise" this back to `forEach`.
+  // named-index contract above true. Do not "modernise" this back to `forEach`.
   for (let index = 0; index < extraRouters.length; index += 1) {
     const router = extraRouters[index];
 
@@ -146,48 +159,6 @@ function assertMountableRouters(extraRouters) {
       );
     }
   }
-}
-
-/**
- * `express.json()` verify hook: records how many bytes of payload the parser
- * actually consumed, as `req.jsonPayloadLength`.
- *
- * WHY THE PARSER IS THE ONLY PLACE THIS CAN BE MEASURED. `express.json()`
- * special-cases an empty payload and yields `{}` for it rather than raising a
- * parse error, so once parsing is done a request that carried no bytes and a
- * request that carried the two bytes `{}` are represented by equal values.
- * Nothing downstream can separate them: the request stream is consumed, and
- * the framing headers answer only for a request that declared
- * `Content-Length` -- a `Transfer-Encoding: chunked` message declares no
- * length, so a zero-byte chunked payload is invisible in the headers. The
- * verify callback runs after the full payload has been read and before it is
- * parsed, which is the one point where the true byte count exists.
- *
- * It only records; it never rejects. A throw from a verify callback is turned
- * by body-parser into a 403 `entity.verify.failed`, a status this service's
- * contract does not include, so validation belongs in the route that has the
- * context to decide -- and does not run at all for a request the parser
- * itself rejects as too large, malformed or unsupported.
- *
- * CONSISTENCY OBLIGATION -- two files, one contract.
- * `src/routes/api.routes.js` reads `req.jsonPayloadLength` to tell an empty
- * payload from an empty JSON document, and treats its absence as "the parser
- * never ran, so nothing was consumed". Removing this hook, renaming the
- * property or dropping it from position 4 therefore turns every JSON-bodied
- * request to `POST /api/v1/echo` into a `400 Request body is required` -- a
- * loud, immediate failure rather than a silent hole in the contract, which is
- * the deliberate choice. Change the two together.
- *
- * @param {import('express').Request} req The request being parsed; receives
- *   the `jsonPayloadLength` property.
- * @param {import('express').Response} res The response, unused. Present
- *   because body-parser's verify signature supplies it.
- * @param {Buffer} buf The raw payload as read, after any `Content-Encoding`
- *   inflation and before parsing. Its `length` is the byte count recorded.
- * @returns {void} Nothing; the payload is neither inspected nor altered.
- */
-function recordJsonPayloadLength(req, res, buf) {
-  req.jsonPayloadLength = buf.length;
 }
 
 /**
@@ -227,14 +198,15 @@ function recordJsonPayloadLength(req, res, buf) {
  * const app = createApp({ extraRouters: [probe] });
  */
 function createApp({ extraRouters = [] } = {}) {
-  // Fail before a single stage is registered: a half-built application handed
-  // back to a caller is worse than no application at all.
+  // Caller input is checked before any registration work begins, so a bad
+  // `extraRouters` is reported against the option and the index that produced
+  // it rather than from somewhere inside the assembled pipeline.
   assertMountableRouters(extraRouters);
 
   const app = express();
 
   /*
-   * APPLICATION SETTINGS -- both declared before any middleware, so the
+   * APPLICATION SETTINGS -- all three declared before any middleware, so the
    * application's posture is established at construction and is the first
    * thing a reader of this file meets.
    */
@@ -251,9 +223,42 @@ function createApp({ extraRouters = [] } = {}) {
   // frozen configuration object -- never a literal here -- because it is only
   // safe when a proxy is genuinely in front of the service and overwrites
   // those headers. With no known topology, trusting them lets any direct
-  // client forge its own address and scheme, which position 1 would then log
-  // as fact. The default is therefore `false`.
+  // client forge its own address and scheme, and position 1's request
+  // serializer writes exactly those two Express values as the access record's
+  // `req.ip` and `req.protocol`, so a forged header would be logged as the
+  // client's real identity. The default is therefore `false`.
   app.set('trust proxy', config.trustProxy);
+
+  // Express generates a weak ETag for every body written through `res.send()`
+  // or `res.json()` and then honours conditional requests against it: a GET
+  // whose `If-None-Match` matches is rewritten to `304 Not Modified` with the
+  // body, content type and length stripped. Every status in this service's
+  // contract is fixed and unconditional, and no response here is one a client
+  // would revalidate -- the root body is a fixed constant, and the probes and
+  // the metrics scrape are point-in-time process state that a fresh request
+  // answers more cheaply than a conditional one. The validator therefore buys
+  // a client nothing and costs those responses their guarantee, so it is not
+  // generated at all. Removing it here rather than per route covers every
+  // response the application produces, including any route added later.
+  //
+  // WHAT THIS DOES NOT DO: it does not make a response non-cacheable. Removing
+  // the validator only stops a stored copy from being REVALIDATED against
+  // this application; forbidding the STORAGE is a separate property and takes
+  // a `Cache-Control` directive on the response that wants it. The probes send
+  // `no-store` from `routes/health.routes.js` for exactly that reason, and it
+  // stays there because it belongs to their contract rather than to every
+  // response this pipeline carries.
+  //
+  // THIS SETTING IS ONLY HALF THE FIX, AND THE OTHER HALF IS NOT A SETTING.
+  // `If-None-Match: *` is treated as fresh whether or not a response carries
+  // an ETag, so with no validator to match, that one header would still turn
+  // a fixed 200 into an empty 304. The freshness test lives inside
+  // `res.send()`, and a response that never calls it cannot be rewritten:
+  // routes/root.routes.js and routes/health.routes.js therefore serialize
+  // their own fixed payloads and terminate with `res.end()`. Neither half is
+  // redundant -- this one closes the matching-validator path for the whole
+  // application, that one closes the wildcard path for the fixed responses.
+  app.set('etag', false);
 
   /*
    * THE REQUEST PIPELINE -- EIGHT POSITIONS, IN THIS ORDER.
@@ -296,19 +301,19 @@ function createApp({ extraRouters = [] } = {}) {
   // passed through as the string it is. An over-limit body becomes an
   // `entity.too.large` error that position 8 renders as 413; a malformed one
   // becomes `entity.parse.failed`, rendered 400.
-  //
-  // `verify` records the consumed payload length -- see
-  // recordJsonPayloadLength above for why a route cannot recover it afterwards.
-  app.use(
-    express.json({ limit: config.bodyLimit, verify: recordJsonPayloadLength })
-  );
+  app.use(express.json({ limit: config.bodyLimit }));
 
   // POSITION 5 -- form body parsing, bounded by the same limit.
   //
-  // `extended: false` selects Node's own querystring parser, which yields flat
-  // string values rather than the rich nested objects the `qs` syntax admits.
-  // This service has no endpoint that wants nested form input, and the simpler
-  // parser has less surface to get wrong.
+  // `extended: false` disables nested form input. It does not swap the parser:
+  // the bundled body-parser 2.3.0 calls `qs.parse()` in both modes, and the
+  // flag sets the parse depth to `0` and clamps the array limit to the number
+  // of parameters actually submitted. With depth `0`, bracket syntax is never
+  // interpreted -- `a[b]=1` arrives as the literal key `a[b]`, not as
+  // `{ a: { b: '1' } }` -- so a body reaches a handler as a flat map of
+  // strings (repeated keys still collect into an array of strings). No endpoint
+  // here wants nested form input, and the object graph an attacker can
+  // construct from a form body is bounded to one level as a result.
   app.use(express.urlencoded({ extended: false, limit: config.bodyLimit }));
 
   // POSITION 6 -- the service's own router tree, mounted as one value:
@@ -357,7 +362,6 @@ function createApp({ extraRouters = [] } = {}) {
   // makes it an error handler.
   app.use(errorHandler);
 
-  // Fully assembled and deliberately not listening.
   return app;
 }
 

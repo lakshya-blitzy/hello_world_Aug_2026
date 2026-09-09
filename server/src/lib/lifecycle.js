@@ -5,29 +5,13 @@
 // Single responsibility: hold the one guarded flag recording whether this
 // process has begun draining, and expose it as a pure read (isShuttingDown)
 // plus a guarded one-way transition (beginShutdown). This module holds state,
-// never policy. The drain *timing* values (DRAIN_DELAY_MS,
-// SHUTDOWN_TIMEOUT_MS) are configuration, and they are read by src/server.js,
-// which owns the drain itself.
+// never policy: the drain *timing* values (DRAIN_DELAY_MS, SHUTDOWN_TIMEOUT_MS)
+// are configuration read by src/server.js, which owns the drain itself.
 //
-// Two layers share this flag, and they sit on opposite sides of the
-// application:
-//
-//   * src/server.js                -- the SIGTERM/SIGINT handler, which SETS
-//                                     it through beginShutdown(), and which
-//                                     also READS it at exactly one point: the
-//                                     listen callback, which must not announce
-//                                     a worker to PM2 as ready when a signal
-//                                     has already begun draining it while the
-//                                     bind was still pending
-//   * src/routes/health.routes.js  -- the readiness route, which READS it to
-//                                     answer 200 "ready" or 503
-//                                     "shutting_down"
-//
-// The two reads ask the same question for different purposes and must not be
-// consolidated: the process layer's read decides whether a PM2 readiness
-// message may be sent, and the route layer's read decides what an HTTP probe is
-// told. Neither owns the other's answer, which is why the state lives here
-// rather than in either of them.
+// Two layers on opposite sides of the application share the flag. The
+// SIGTERM/SIGINT handler in src/server.js sets it and reads it back; the
+// readiness route in src/routes/health.routes.js reads it. What each does with
+// the answer is documented on the two functions below.
 //
 // WHY THIS MODULE EXISTS AT ALL. Do not "tidy up" by folding the flag into
 // src/server.js. Doing so forces the readiness route to import the process
@@ -41,11 +25,12 @@
 // at start-up, which is the hardest kind of failure to diagnose. Holding the
 // state in a module both layers can depend on removes the cycle entirely.
 //
-// WHY THIS FILE IMPORTS NOTHING. Being a dependency-free leaf is precisely
-// what makes it safe for the process layer and the route layer to consume in
-// either order. Any require here -- configuration, the logger, even a Node
-// built-in -- would give this module edges of its own and put the cycle back
-// within reach. There are deliberately no imports below.
+// WHY THIS FILE IMPORTS NOTHING. It deliberately has no dependencies, so
+// either layer can load it in any order. Importing an application module here
+// -- configuration, the logger, a route -- would give this module edges of its
+// own and could reopen such a cycle. A Node built-in carries no such risk,
+// since it cannot lead back into this application's module graph, but none is
+// needed here.
 
 'use strict';
 
@@ -110,7 +95,4 @@ function beginShutdown() {
   return true;
 }
 
-// The public surface is exactly these two functions: one read, one guarded
-// transition. The flag above is deliberately not exported, so this is the only
-// way in or out of the drain state.
 module.exports = { isShuttingDown, beginShutdown };

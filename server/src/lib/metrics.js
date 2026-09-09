@@ -7,80 +7,47 @@
  * of the `/metrics` endpoint; `../routes/metrics.routes.js` is the *transport*
  * half and does nothing but serve the string `render()` returns.
  *
- * The module is a dependency-free leaf on purpose. It imports nothing at all
- * -- not even the application configuration -- and reads nothing from the
- * environment. Its only outside contact is the `process` global, for the
- * three process figures `render()` reports. Two consequences follow, and both
- * are deliberate rather than oversights:
+ * The module is a dependency-free leaf on purpose. It issues no `require` at
+ * all, and its only outside contact is the `process` global, for the three
+ * process figures `render()` reports. Two consequences follow, and both are
+ * deliberate rather than oversights:
  *
  *   1. It has exactly one writer (`../middleware/request-context.js`) and
  *      exactly one reader (`../routes/metrics.routes.js`), so measurement stays
- *      separate from transport and no third module can mutate a counter.
- *   2. The process identity every sample carries -- the service name and the
- *      PM2 cluster instance -- is NOT read here. It is passed IN, as the
- *      `identity` argument of `render()`, by that one reader. The identity
- *      originates in `../config`, the only module allowed to read the
- *      environment, and the reader consumes it exactly as
- *      `../routes/health.routes.js` consumes it for the `GET /health` payload.
- *      So the exposition does carry `service` and `instance` labels while this
- *      file keeps zero imports: the requirement that `GET /health`, the metrics
- *      output and every log line share ONE shape is satisfied at the transport
- *      boundary instead of by giving the counter store a dependency. Do not
- *      "simplify" this by importing `../config` here -- that would close the
- *      leaf property this module's single-writer guarantee rests on, and it
- *      would buy nothing the argument does not already provide.
+ *      separate from transport and no third module can move a counter.
+ *   2. The exposition carries no identity. No sample names the service or the
+ *      PM2 cluster ordinal, and the only label in the whole document is the
+ *      fixed `status_class` on the per-class family. Those identity values
+ *      could only come from `../config`, which this module must not import --
+ *      and leaving them out is also what keeps an unauthenticated scrape from
+ *      disclosing service identity or worker topology. `GET /health` and every
+ *      log line carry the identity instead; this document carries request
+ *      counts and process figures, and nothing else.
  *
  * WHY the counters are per-worker, and why that is not a defect: under PM2
  * cluster mode every worker is its own OS process with its own copy of this
  * module's state, and all workers share one listening socket. A scrape reaches
  * whichever worker the socket assigns it to, so a single scrape sees *one
- * worker's* numbers and consecutive scrapes may see different ones. That is
- * inherent to counting in-process behind a shared port, not a bug to fix here.
- * The only correct fix -- an aggregator in front of the workers -- is out of
- * scope for this service; `server/README.md` states the same caveat for
- * operators, and this comment states it for the next developer.
+ * worker's* numbers and consecutive scrapes may see different ones -- and,
+ * there being no worker label in the document, a scrape cannot be attributed
+ * to a particular worker at all. That is inherent to counting in-process
+ * behind a shared port, not a bug to fix here. The only correct fix -- an
+ * aggregator in front of the workers -- is out of scope for this service;
+ * `server/README.md` states the same caveat for operators.
  *
- * THE TOTAL-VERSUS-BUCKET IDENTITY, STATED EXACTLY. The total is incremented
- * when a request is *accepted*; the per-class buckets are incremented when its
- * response *completes*. Both moves are synchronous and paired --
- * `recordRequestStart()` raises the total and the gauge together, and
- * `recordRequestEnd()` lowers the gauge and raises one bucket together -- so no
- * scrape can catch a half-applied update. The relationship is therefore an
- * EXACT identity at every externally observable point, not an approximation
- * and not something that only holds while the process is idle:
- *
- *     http_requests_total
- *       = sum(status_class buckets) + http_requests_in_flight + A
- *
- * where `A` counts the requests whose response never completed because the
- * client destroyed the connection first. Those are real accepted requests, so
- * they are in the total; they completed nothing, so they belong in no status
- * bucket -- see the abort contract on `recordRequestEnd()`. `A` is deliberately
- * not exposed as a seventh metric family, because the six families below are
- * the fixed exposition surface, so read the identity like this: on a worker
- * that has served no aborted connection the two sides are equal to the digit,
- * and a shortfall in `sum(buckets)` IS the number of aborted responses. What
- * the identity rules out is the other direction -- a surplus, or a shortfall on
- * a worker known to have had no aborts, is not arithmetic. It means a missed or
- * doubled `recordRequestEnd()` call, or a completed response whose status fell
- * outside 100-599, and either is a defect to find rather than a figure to
- * explain.
+ * HOW THE THREE REQUEST FAMILIES RELATE. The total is incremented when a
+ * request is *accepted* and the per-class buckets when its response
+ * *completes*, with the gauge covering the span between -- so a request still
+ * being handled is counted by `http_requests_in_flight` and creates no gap.
+ * `sum(status_class buckets) + http_requests_in_flight` therefore accounts for
+ * `http_requests_total` exactly, save for requests that ended with no
+ * countable status: a response the client destroyed before it finished leaves
+ * the total with nothing to tally, and the shortfall is that count. A
+ * *surplus* is the reading that is not arithmetic -- it means a doubled
+ * `recordRequestEnd()` call, or a bucket moved outside these two functions,
+ * and either is a defect to find rather than a figure to explain.
  */
 'use strict';
-
-/*
- * ---------------------------------------------------------------------------
- * The counter store
- * ---------------------------------------------------------------------------
- * Module-scoped and deliberately private: none of the three values below is
- * exported, so the only way to change a counter is to call one of the two
- * recording functions. That is what keeps "exactly one writer" a property of
- * the design rather than a convention a caller could quietly break.
- *
- * Every counter declared here is both incremented by a recording function and
- * emitted by `render()`. A counter that is written but never rendered is
- * invisible; a family that is rendered but never written reads zero forever.
- */
 
 /**
  * Total requests accepted by this worker since it started.
@@ -137,15 +104,12 @@ const requestsByStatusClass = {
 const STATUS_CLASS_KEYS = ['1xx', '2xx', '3xx', '4xx', '5xx'];
 
 /*
- * ---------------------------------------------------------------------------
- * The write side
- * ---------------------------------------------------------------------------
- * WHY two functions rather than one: a request is accepted at one moment and
- * its response completes at another, and `inFlight` has to move in opposite
- * directions at those two moments. A single "record this request" call would
- * have to pick one of them, and either choice makes the gauge wrong -- count
- * on accept and it never comes down, count on completion and it never goes up.
- * Splitting the write side is the honest shape for that lifecycle.
+ * WHY THE WRITE SIDE IS TWO FUNCTIONS RATHER THAN ONE: a request is accepted
+ * at one moment and its response completes at another, and `inFlight` has to
+ * move in opposite directions at those two moments. A single "record this
+ * request" call would have to pick one of them, and either choice makes the
+ * gauge wrong -- count on accept and it never comes down, count on completion
+ * and it never goes up.
  *
  * Both functions are called from the same single writer,
  * `../middleware/request-context.js`, which sits at position 1 of the
@@ -164,14 +128,10 @@ const STATUS_CLASS_KEYS = ['1xx', '2xx', '3xx', '4xx', '5xx'];
  * The `hasOwnProperty` check is the guard that keeps the label set fixed: any
  * value that does not land in 100-599 -- a non-numeric value
  * (`Math.floor(NaN / 100)` renders as the key `"NaNxx"`) or a status outside
- * the HTTP range -- returns `null` instead of naming a sixth bucket.
- *
- * This is purely a guard against a caller defect, and it is worth being precise
- * about why: the ONE expected non-status path, an aborted response, is handled
- * by `recordRequestEnd()` before it ever calls this function, so a `null` from
- * here is never ordinary traffic. Node and Express only produce statuses in
- * 100-599, so reaching the `null` branch means a caller passed something that
- * is not a status code at all.
+ * the HTTP range -- returns `null` instead of naming a sixth bucket. Node and
+ * Express only ever produce statuses in 100-599, so that branch guards the
+ * store's fixed five-series shape rather than describing a path ordinary
+ * traffic takes.
  *
  * @param {number} statusCode HTTP response status code, normally 100-599.
  * @returns {string|null} One of `'1xx'`..`'5xx'`, or `null` when the code does
@@ -205,27 +165,10 @@ function recordRequestStart() {
 }
 
 /**
- * Record that a request has finished, whether or not its response completed.
+ * Record that a request has finished.
  *
- * Lowers the in-flight gauge by one and -- only for a response that actually
- * completed -- increments the bucket for its status class.
- *
- * THE ABORT CONTRACT, AND WHY THE STATUS IS OPTIONAL. A request can leave the
- * service two ways: its response completes, or the client destroys the
- * connection first. Both must lower the gauge, but only the first has a status
- * that means anything. `res.statusCode` on an aborted response is whatever it
- * happened to be when the socket died -- and on an abort that arrives before
- * the handler responded, that is Node's UNTOUCHED DEFAULT OF 200. Passing it
- * would file an abandoned request in the `2xx` bucket of a family whose name
- * and HELP text both say "completed", turning dropped traffic into apparent
- * success: the one failure mode nobody reading a dashboard would ever question.
- *
- * So the caller passes a status ONLY for a completed response and `undefined`
- * otherwise, and the rule it decides that with is `res.writableFinished` --
- * true only once the response has been fully written. An abort therefore lands
- * in no bucket at all, which is why the module header's identity carries an
- * explicit `A` term for aborted responses rather than claiming the total and
- * the buckets always agree.
+ * Lowers the in-flight gauge by one and increments the bucket for the status
+ * class of the response that completed.
  *
  * PAIRING CONTRACT -- read this before wiring the caller. This function must
  * be called **exactly once for every `recordRequestStart()` call, including
@@ -244,169 +187,66 @@ function recordRequestStart() {
  *
  * Sole permitted caller: `../middleware/request-context.js`, on completion.
  *
- * @param {number|undefined} statusCode Status code of the response, normally
- *   100-599 -- and `undefined` when the response did NOT complete, per the
- *   abort contract above. `undefined` lowers the in-flight gauge and tallies
- *   nothing. A number outside the five known status classes also lowers the
- *   gauge without tallying, but that path is a caller defect rather than an
- *   expected outcome; either way the fixed five-series label set is preserved.
+ * @param {number} statusCode Status code of the response, normally 100-599.
+ *   Required: it is the value that decides which of the five buckets moves,
+ *   and `http_requests_by_status_class_total` counts responses by the status
+ *   they completed with. A value that maps to none of the five classes lowers
+ *   the gauge and tallies nothing, which is what keeps the label set fixed at
+ *   five series.
  * @returns {void}
  */
 function recordRequestEnd(statusCode) {
   // Unconditional, and first: every request that started has now finished, so
-  // the gauge comes down whatever the outcome was. Making this independent of
-  // the status is what keeps the pairing contract above satisfiable for an
-  // aborted request.
+  // the gauge comes down whatever status the response carried. Keeping this
+  // independent of the status is what makes the pairing contract above
+  // satisfiable for a request that ended without a countable status.
   inFlight -= 1;
-
-  // The abort path, checked explicitly rather than left to fall through
-  // `statusClassKey()`'s defect guard. Both would skip the increment, but only
-  // an explicit test says that an absent status is EXPECTED here -- a reader
-  // who saw an abort reach a branch documented as "a status the service should
-  // never have produced" would reasonably conclude the guard was load-bearing
-  // for ordinary traffic and try to "fix" it into a bucket.
-  if (statusCode === undefined) {
-    return;
-  }
 
   const key = statusClassKey(statusCode);
 
   // A `null` key is the guard path described on `statusClassKey()`: skip the
-  // per-class increment rather than create a sixth series for a status the
-  // service should never have produced.
+  // per-class increment rather than create a sixth series for a value that is
+  // not one of the five status classes.
   if (key !== null) {
     requestsByStatusClass[key] += 1;
   }
 }
 
-/*
- * ---------------------------------------------------------------------------
- * The read side
- * ---------------------------------------------------------------------------
- * One exported function producing the whole exposition document as a string,
- * plus one private helper it uses to make a label value safe to embed. Both
- * are pure with respect to the store -- rendering never mutates a counter --
- * so a scrape cannot perturb what it measures.
- */
-
-/**
- * Escape a value for use inside a Prometheus label, per the text exposition
- * format's label rules.
- *
- * The format allows any UTF-8 sequence in a label value provided three
- * characters are escaped: the backslash as `\\`, the double quote as `\"` and
- * the line feed as `\n`. The replacements happen in that order because the
- * first one introduces backslashes the later two must not re-escape.
- *
- * WHY THIS EXISTS AT ALL, given that both label values this module renders --
- * a service name and a small integer -- are tame today. `render()` is a
- * document GENERATOR, and its identity labels arrive from a caller rather than
- * from state this file owns. An unescaped quote in a label value does not
- * produce a wrong number; it produces a line a strict parser rejects, which
- * fails the whole scrape and takes the other nine samples down with it. This
- * is four lines of arithmetic-free string work on a path that runs once per
- * scrape, so paying it unconditionally is cheaper than reasoning about whether
- * today's caller still holds tomorrow.
- *
- * Not exported: it is an implementation detail of the exposition format, and a
- * caller with it in hand would be one step from assembling sample lines
- * outside `render()`.
- *
- * @param {string|number} value The raw label value.
- * @returns {string} The value with backslash, double quote and line feed
- *   escaped, ready to sit between the quotes of `name="..."`.
- */
-function escapeLabelValue(value) {
-  return String(value)
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, '\\n');
-}
-
 /**
  * Render the current metrics in Prometheus text exposition format.
  *
- * Emits six metric families, each preceded by its `# HELP` and `# TYPE`
- * lines: the lifetime request total, the five per-status-class buckets, the
- * in-flight gauge, and three process figures. The `process_*` family names
- * deliberately match the conventional Prometheus process-collector names, so a
- * scraper or dashboard that already expects them works without remapping.
+ * Takes no arguments, and reads nothing outside this module but `process`:
+ * every number in the document comes from the counter store above or from one
+ * of the three process figures sampled below. Rendering never mutates a
+ * counter, so a scrape cannot perturb what it measures.
  *
- * THE IDENTITY LABELS, AND WHY THEY ARE AN ARGUMENT. Every sample carries
- * `service="<name>",instance="<n>"`, so a reader of the raw exposition can tell
- * which worker's numbers these are -- and so that `GET /health`, the metrics
- * output and every log line describe the process the same way, with `instance`
- * present and `0` even when PM2 did not launch it. The values cannot be read
- * here: only `../config` may touch the environment, and this module imports
- * nothing (see the header). So the reader passes them in. Cardinality is
- * unaffected -- one process has one identity, so this adds no series, and the
- * exposition stays at ten sample lines.
+ * Emits six metric families, each preceded by its `# HELP` and `# TYPE` lines
+ * -- the lifetime request total, the five per-status-class buckets, the
+ * in-flight gauge, and three process figures -- for ten sample lines in all.
+ * The `process_*` family names deliberately match the conventional Prometheus
+ * process-collector names, so a scraper or dashboard that already expects them
+ * works without remapping.
  *
- * ONE CONSEQUENCE TO KNOW BEFORE DEBUGGING A DASHBOARD: `instance` is also a
- * label Prometheus attaches itself, from the scrape target. With the default
- * `honor_labels: false` the server keeps its own and renames the one in this
- * document to `exported_instance`; with `honor_labels: true` the value below
- * wins. Neither is a defect here -- the name is chosen to match the `instance`
- * field in `/health` and in the logs, because that shared shape is the point --
- * but a query written against a Prometheus server may need
- * `exported_instance`.
+ * THE ONLY LABEL IN THE DOCUMENT is the fixed `status_class` on
+ * `http_requests_by_status_class_total`. No sample carries a service name, a
+ * cluster ordinal or any other configuration-derived value: this module
+ * imports nothing and so cannot look one up, and the minimal surface is the
+ * point rather than a limitation -- `/metrics` is unauthenticated, and a
+ * document that named the process and its cluster position would tell a caller
+ * more about the deployment than a scrape needs. The identity is available
+ * from `GET /health` and from every log line, both of which take it from
+ * `../config`.
  *
  * Sole permitted caller: `../routes/metrics.routes.js`, which serves the
  * returned string under `Content-Type: text/plain; version=0.0.4`. This
  * function sets no header and knows nothing about HTTP -- that separation is
  * why the measurement half of `/metrics` can be exercised without a server.
  *
- * @param {{ service: string, instance: number }} identity The rendering
- *   process's identity, sourced from the frozen configuration object by the
- *   caller: `service` is the service's canonical name and `instance` is the
- *   PM2 cluster ordinal (`0` when the process was launched directly).
  * @returns {string} The exposition document, terminated by a single newline.
  *   The trailing newline is required by the text format: the final sample line
  *   must be LF-terminated or a strict parser rejects the document.
- * @throws {TypeError} When `identity` is absent or either field is the wrong
- *   shape. This is a precondition check on a caller defect, and failing loudly
- *   is deliberate: the alternative is an exposition that quietly advertises
- *   `service=""`, attributing a worker's counters to a nameless series that
- *   silently merges with every other misconfigured worker. Both values come
- *   from configuration validated at start-up, so a defect here shows up on the
- *   very first scrape rather than intermittently.
  */
-function render(identity) {
-  // Validated before anything is read or built, so a bad call cannot produce a
-  // half-formed document. Each branch names the field and what it received --
-  // the caller is a route handler, so this message is what reaches the log.
-  if (identity === null || typeof identity !== 'object') {
-    throw new TypeError(
-      'render(identity) requires an identity object of the shape ' +
-        `{ service, instance } (received ${typeof identity})`,
-    );
-  }
-
-  const { service, instance } = identity;
-
-  if (typeof service !== 'string' || service.length === 0) {
-    throw new TypeError(
-      'render(identity) requires a non-empty string identity.service ' +
-        `(received ${typeof service})`,
-    );
-  }
-
-  // `Number.isInteger` rather than a `typeof`/`>= 0` pair: it rejects `NaN`,
-  // the infinities and a fractional value in one test, and a cluster ordinal is
-  // a whole number by definition.
-  if (!Number.isInteger(instance) || instance < 0) {
-    throw new TypeError(
-      'render(identity) requires a non-negative integer identity.instance ' +
-        `(received ${String(instance)})`,
-    );
-  }
-
-  // Built once and shared by all ten sample lines, so the identity cannot
-  // differ between two samples of the same scrape.
-  const identityLabels =
-    `service="${escapeLabelValue(service)}",` +
-    `instance="${escapeLabelValue(instance)}"`;
-
+function render() {
   // WHY the three process figures are read here, inside `render()`, rather
   // than sampled on a timer or cached: a scrape must reflect the instant it
   // was taken, and a background sampler would put an interval timer into a
@@ -427,7 +267,7 @@ function render(identity) {
   const lines = [
     '# HELP http_requests_total Total HTTP requests accepted by this worker since start.',
     '# TYPE http_requests_total counter',
-    `http_requests_total{${identityLabels}} ${requestsTotal}`,
+    `http_requests_total ${requestsTotal}`,
     '# HELP http_requests_by_status_class_total Completed HTTP requests by response status class.',
     '# TYPE http_requests_by_status_class_total counter',
   ];
@@ -439,58 +279,31 @@ function render(identity) {
     const count = requestsByStatusClass[statusClass];
 
     lines.push(
-      `http_requests_by_status_class_total{${identityLabels},status_class="${statusClass}"} ${count}`,
+      `http_requests_by_status_class_total{status_class="${statusClass}"} ${count}`,
     );
   }
 
-  // Counts are plain integers and are interpolated as such; only the two
-  // fractional figures are formatted, and `toFixed()` is a READABILITY choice
-  // rather than a compliance one. Being exact about that, because the opposite
-  // is easy to assume: the text format takes a sample value as a float "as
-  // required by the Go strconv package", so exponential notation is perfectly
-  // legal -- the format's own reference exposition contains `1.458255915e9`.
-  // Default number-to-string conversion would therefore also parse. What it
-  // would not do is stay legible: it renders a nearly-idle worker's CPU time as
-  // `1.2e-5`, so two consecutive scrapes read by hand or diffed by a script
-  // change width and notation as the value crosses 1e-6. Fixed decimals give
-  // every scrape the same shape -- millisecond resolution on uptime, microsecond
-  // on CPU seconds -- which is what makes the document skimmable, and the range
-  // these two figures occupy is nowhere near the magnitude at which `toFixed()`
-  // would itself fall back to exponential form.
+  // `toFixed()` keeps the two fractional figures at a fixed width, so a
+  // near-idle worker's CPU time reads as `0.000012` rather than `1.2e-5`.
   lines.push(
     '# HELP http_requests_in_flight HTTP requests currently being handled by this worker.',
     '# TYPE http_requests_in_flight gauge',
-    `http_requests_in_flight{${identityLabels}} ${inFlight}`,
+    `http_requests_in_flight ${inFlight}`,
     '# HELP process_uptime_seconds Seconds elapsed since this worker process started.',
     '# TYPE process_uptime_seconds gauge',
-    `process_uptime_seconds{${identityLabels}} ${uptimeSeconds.toFixed(3)}`,
+    `process_uptime_seconds ${uptimeSeconds.toFixed(3)}`,
     '# HELP process_resident_memory_bytes Resident set size of this worker process, in bytes.',
     '# TYPE process_resident_memory_bytes gauge',
-    `process_resident_memory_bytes{${identityLabels}} ${residentMemoryBytes}`,
+    `process_resident_memory_bytes ${residentMemoryBytes}`,
     '# HELP process_cpu_seconds_total Total user plus system CPU time consumed by this worker, in seconds.',
     '# TYPE process_cpu_seconds_total counter',
-    `process_cpu_seconds_total{${identityLabels}} ${cpuSeconds.toFixed(6)}`,
+    `process_cpu_seconds_total ${cpuSeconds.toFixed(6)}`,
   );
 
   return `${lines.join('\n')}\n`;
 }
 
-/*
- * ---------------------------------------------------------------------------
- * Exports
- * ---------------------------------------------------------------------------
- * Exactly two writers and one reader, and nothing else. The counter store
- * itself stays module-private: exporting it would let any module increment a
- * counter -- or overwrite one -- without going through the two functions that
- * define what a "request" means here, and the single-writer property the
- * module is built around would become unenforceable.
- *
- * Nothing further is exported on purpose. There is no `reset()`, because a
- * Prometheus counter is monotonic for the lifetime of the process and a worker
- * is replaced by PM2's `autorestart` rather than zeroed in place. There is no
- * latency histogram or summary, because response time is already carried on
- * the pino-http access record. There is no JSON renderer beside the text one,
- * because the single reader serves Prometheus text. And there are no
- * per-counter getters, because the exposition document is the read interface.
- */
+// The counter store stays module-private: these three functions are the only
+// way to move or read a counter, which is what makes "exactly one writer" a
+// property of the design rather than a convention.
 module.exports = { recordRequestStart, recordRequestEnd, render };

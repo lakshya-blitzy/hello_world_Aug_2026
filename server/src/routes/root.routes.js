@@ -7,18 +7,6 @@
 // express.Router(), and src/routes/index.js mounts that router at `/`, so the
 // effective path is `GET /`.
 //
-// WHAT THIS MODULE DELIBERATELY DOES NOT DO. It registers no middleware, sets
-// no application-level settings, writes no log line of its own, and touches no
-// response header other than the Content-Type its own contract fixes. Every
-// cross-cutting concern is already applied by the ordered pipeline in
-// src/app.js before this router is ever reached: request identity and access
-// logging (position 1), security headers (2), response compression (3) and
-// body parsing (4-5). The aggregated router tree is registered at position 6,
-// the terminal 404 producer at 7, and the four-arity error handler at 8.
-// This module must therefore stay a plain, mountable Router: it neither
-// terminates the pipeline itself nor handles errors, because the two positions
-// that do already sit behind it.
-//
 // WHY THE RESPONSE BODY IS WHAT IT IS -- read this before changing it.
 // `Hello, World!\n` is a PLAN DECISION. It is not a user-supplied requirement,
 // and it is not a baseline recovered from a previous implementation: this
@@ -36,21 +24,9 @@
 // route to re-read. Folding this handler into src/routes/index.js, or into any
 // other route module, would destroy exactly that isolation -- which is this
 // module's entire reason for existing. Do not consolidate it away.
-//
-// CONSISTENCY OBLIGATION. The endpoint-reference table in server/README.md is
-// the canonical, single-location documentation of this contract. The status
-// code, the content type and the body below are reproduced there; changing any
-// of the three here without updating that table makes the runbook untrue.
 
 'use strict';
 
-// Express is deliberately the only import here, and the list of things this
-// module does NOT import is the point: not src/config, not src/lib/logger, not
-// src/lib/http-error. The response below is unconditional, so configuration
-// owns nothing in it; logging is already done for every request by position 1
-// of the pipeline; and a route with no failure path raises no error to type.
-// Each of those requires would be dead weight in a module whose whole job is
-// one fixed response.
 const express = require('express');
 
 /**
@@ -68,6 +44,28 @@ const express = require('express');
 const router = express.Router();
 
 /**
+ * The root response body.
+ *
+ * A single-quoted literal with an explicit `\n` escape -- not a multi-line
+ * template literal, which would embed this file's own indentation into the
+ * payload. Exactly one trailing newline byte is part of the contract.
+ *
+ * @type {string}
+ */
+const ROOT_BODY = 'Hello, World!\n';
+
+/**
+ * `ROOT_BODY`'s length in bytes, measured once at module load.
+ *
+ * Derived from the body rather than written as a number so the payload and the
+ * `Content-Length` header the handler sends cannot drift apart if the body
+ * ever changes.
+ *
+ * @type {number}
+ */
+const ROOT_BODY_BYTE_LENGTH = Buffer.byteLength(ROOT_BODY);
+
+/**
  * `GET /` -- the service's root response.
  *
  * Writes the fixed root response and returns: status `200`, `Content-Type:
@@ -78,7 +76,7 @@ const router = express.Router();
  * input, performs no I/O and consults no state, so there is no condition it
  * could reject and nothing that could throw -- which is why it takes no
  * `next` parameter, adds no validation and wraps nothing in try/catch. It also
- * does not call `next()` on success: the response is complete when `send()`
+ * does not call `next()` on success: the response is complete when `res.end()`
  * returns, and delegating onward from here would fall through to the terminal
  * 404 producer registered after this router.
  *
@@ -93,20 +91,31 @@ const router = express.Router();
  *   handler is the response written to `res`.
  */
 router.get('/', (req, res) => {
-  // Setting the type BEFORE sending is required rather than stylistic. Given a
-  // string body and no Content-Type already set, Express infers `text/html`,
-  // which would silently violate the contract this route documents. Calling
-  // `res.type('text/plain')` first appends the charset for text types, so the
-  // header emitted is exactly `text/plain; charset=utf-8`.
-  //
-  // The body is a single-quoted literal with an explicit `\n` escape -- not a
-  // multi-line template literal, which would embed this file's own indentation
-  // into the payload, and not a second newline from any other source. Exactly
-  // one trailing newline byte is part of the contract.
-  res.status(200).type('text/plain').send('Hello, World!\n');
+  // WHY THIS WRITES THE RESPONSE ITSELF RATHER THAN CALLING `res.send()`.
+  // `res.send()` evaluates conditional-request freshness before it writes: on
+  // a GET it rewrites a 2xx to `304 Not Modified` and strips the body, and
+  // `If-None-Match: *` counts as fresh whether or not the response carries an
+  // ETag -- so disabling ETag generation in ../app.js does not close that path
+  // on its own. A single request header would otherwise decide what this route
+  // returns, which is not a choice the fixed contract above leaves open.
+  // `res.end()` performs no freshness test, so the status and the body below
+  // are what every caller gets.
+  res.status(200);
+
+  // Written verbatim through the raw setter rather than inferred via
+  // `res.type('text/plain')`: the contract names the full header value, and a
+  // string body with no Content-Type would otherwise be served as `text/html`.
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+
+  // `res.send()` derives this header itself; `res.end()` does not, and
+  // without it Node frames the response with chunked transfer encoding
+  // instead of a length -- so it is set here, from the body's own measured
+  // size, to keep the wire form a fixed-length payload implies.
+  // Safe against `compression()` at pipeline position 3: that middleware
+  // removes this header whenever it compresses, and this body is far below its
+  // size threshold, so it is never compressed in the first place.
+  res.setHeader('Content-Length', ROOT_BODY_BYTE_LENGTH);
+  res.end(ROOT_BODY);
 });
 
-// The public surface is the Router itself and nothing else: no named helpers,
-// no configuration hook and no test-only export. src/routes/index.js consumes
-// this value directly, so the assignment must stay a bare Router.
 module.exports = router;

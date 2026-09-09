@@ -46,7 +46,7 @@ this document is run from `server/`, and no later block repeats the change of
 directory — so change into it now, from the repository root:
 
 ```bash
-cd server        # the only command in this document run from the repository root
+cd server
 ```
 
 PM2 depends on this too, not just the reader: the descriptor resolves its
@@ -124,7 +124,9 @@ whoever re-verifies the stack, and npm warns when the running toolchain falls
 outside the declared range.
 
 **Process manager.** PM2 **7.0.4** and its **pm2-logrotate 3.0.0** module,
-installed globally on the host. Installing them is the first of the four
+installed globally on the host, outside this repository's dependency tree.
+Installing them — with PM2's one affected transitive package replaced and the
+module taken from a reviewed artefact — is the first of the four
 [host prerequisites](#8-host-prerequisites--four-required-steps) and is
 required before any `pm2:*` script will work.
 
@@ -283,19 +285,12 @@ launched directly with no PM2 therefore reports `instance: 0` rather than
 omitting the field, so both payloads have the same shape however the service
 was started and no consumer has to handle a missing key.
 
-`GET /metrics` carries it as well: every sample in the exposition is labelled
-`service="hello-world-service",instance="<n>"`, so the worker that answered a
-scrape is read straight off the labels — the same field name and the same
-value as the `instance` in the `GET /health` payload and on every log line.
-
-One note before a real Prometheus server is pointed at this endpoint:
-`instance` is also a label Prometheus attaches itself, taken from the scrape
-target. With the default `honor_labels: false` the server keeps its own and
-renames the one above to `exported_instance`, so a query written against
-Prometheus may have to use that name. That is a detail of querying rather than
-a defect here — the label is deliberately called `instance` so that
-`GET /health`, the metrics output and the logs describe the process
-identically. See [section 10](#10-metrics-and-their-honest-limitation).
+`GET /metrics` does **not** carry it: the exposition carries no identity
+labels at all, deliberately, because the counter store reads no configuration
+and the scrape surface is kept to counts and process figures. The instance is
+read from the `GET /health` payload or from a log line instead, and a scrape
+therefore cannot be attributed to a particular worker. See
+[section 10](#10-metrics-and-their-honest-limitation).
 
 ## 5. Running locally
 
@@ -307,6 +302,25 @@ npm run dev         # NODE_ENV=development node src/server.js
 Both bind `HOST:PORT` — `0.0.0.0:3000` with no `.env`. `npm start` respects
 whatever `NODE_ENV` the environment or `.env` supplies; `npm run dev` forces
 `development` regardless.
+
+**That default accepts on every interface, and no route authenticates its
+caller.** With no `.env`, `HOST` is `0.0.0.0`, so a local run is reachable
+from any address that reaches the machine — `GET /metrics`, with its request
+counts and process figures, included
+([every route is unauthenticated](#every-route-is-unauthenticated)). Run it
+that way only on a host you trust to be isolated. Anywhere else, bind to
+loopback:
+
+```bash
+HOST=127.0.0.1 npm start
+```
+
+`HOST=127.0.0.1` in `.env` has the same effect for every later start. A
+service that is meant to be reachable from another host belongs behind the
+reverse proxy and TLS termination of
+[section 8.4](#84-configure-the-reverse-proxy-and-tls), which is also where
+`GET /metrics` is restricted to internal callers — not on an open `0.0.0.0`
+binding.
 
 Outside production the logger attaches a `pino-pretty` transport, so output is
 human-readable text rather than NDJSON. The raw NDJSON contract described in
@@ -394,26 +408,28 @@ simply never land on the draining worker, and with `DRAIN_DELAY_MS=0` — a
 valid setting — there is no window in which it could. Treat neither answer as
 contractual during a reload. The only case in which the negative answer is
 what *every* poll gets is the whole service stopping, whether that is a
-single-process deployment or `pm2 stop` on the cluster. (Illustration, not a
-promise: on the default two-worker topology a poller at 100 ms intervals
-happened to see `503` on 13, 14 and 13 of 120 polls across three reloads.)
-What makes a cluster reload a handover is PM2's `ready` overlap and its
-retirement of the outgoing worker, not this probe — see
+single-process deployment or `pm2 stop` on the cluster. What makes a cluster
+reload a handover is PM2's `ready` overlap and its retirement of the outgoing
+worker, not this probe — see
 [the readiness handshake](#the-readiness-handshake).
 
-**`GET /metrics`** — Prometheus text exposition format. See
+**`GET /metrics`** — Prometheus text exposition format. No sample carries
+any label except `status_class` on the status-class family. See
 [section 10](#10-metrics-and-their-honest-limitation).
 
 ```bash
-curl -s http://localhost:3000/metrics | head -5
+curl -s http://localhost:3000/metrics | head -6
 # # HELP http_requests_total Total HTTP requests accepted by this worker since start.
 # # TYPE http_requests_total counter
 # http_requests_total 3
+# # HELP http_requests_by_status_class_total Completed HTTP requests by response status class.
+# # TYPE http_requests_by_status_class_total counter
+# http_requests_by_status_class_total{status_class="1xx"} 0
 ```
 
 **`POST /api/v1/echo`** — echoes a JSON object or array back with the request
-id. The request must declare `Content-Type: application/json` and must
-actually carry a payload.
+id. The request must declare `Content-Type: application/json`, and the parsed
+body must be a JSON object carrying at least one key, or an array.
 
 ```bash
 curl -s -X POST http://localhost:3000/api/v1/echo \
@@ -421,34 +437,35 @@ curl -s -X POST http://localhost:3000/api/v1/echo \
   -d '{"hello":"world"}'
 # {"echo":{"hello":"world"},"requestId":"..."}
 
-# 200 -- an empty JSON object is a valid body, echoed back as it arrived
-curl -s -X POST http://localhost:3000/api/v1/echo \
-  -H 'Content-Type: application/json' -d '{}'
-# {"echo":{},"requestId":"..."}
-
-# 200 -- so is an empty array
+# 200 -- an empty array is a valid body, echoed back as it arrived
 curl -s -X POST http://localhost:3000/api/v1/echo \
   -H 'Content-Type: application/json' -d '[]'
 # {"echo":[],"requestId":"..."}
 ```
 
-**"Empty" here means an empty payload** — a request that carries no bytes. An
-empty JSON object `{}` and an empty array `[]` are deliberate bodies, not
-missing ones: both return `200` with `echo` set to exactly what was sent.
+**An empty JSON object `{}` is rejected; an empty array `[]` is not.** The two
+are not symmetric, and the reason is the parser: `express.json()` special-cases
+an empty payload and yields `{}` for it rather than raising a parse error, so a
+request that carried no bytes and a request that carried the two bytes `{}`
+reach the endpoint as the same value and cannot be told apart. An empty body is
+a `400`, so a zero-key object is one too. An empty array can only come from a
+client that explicitly sent `[]` — the parser never produces one — so it is a
+deliberate body and is echoed back unchanged.
 
 Every rejection below is a `400` that names the fault it actually found, in
 the same `{ error: { status, message, requestId } }` envelope. The endpoint
 owns three messages, checked in this order:
 
 - **A media type that is not `application/json`** — a form-encoded body
-  included — is `Request Content-Type must be application/json`. The media
-  type is checked first, so a bodyless request declaring any other type is
-  answered here as well.
-- **No payload** is `Request body is required`. This covers every framing: no
-  `Content-Length` at all, `Content-Length: 0`, and a
-  `Transfer-Encoding: chunked` message that streams zero bytes. A bodyless
-  request that correctly declares `Content-Type: application/json` gets this
-  body-specific reason rather than a media-type one.
+  included — is `Request Content-Type must be application/json`. The media type
+  is checked first, so a bodyless request declaring any other type is answered
+  here as well, and so is a request that sends no payload framing at all: with
+  neither a `Content-Length` nor a `Transfer-Encoding` header there is no
+  payload for the declared media type to describe, which is what a
+  `curl -X POST` with no `--data` sends.
+- **An empty body** is `Request body is required`. That covers a zero-length
+  payload (`Content-Length: 0`), a `Transfer-Encoding: chunked` message that
+  streams no bytes, and a literal `{}` — all three arrive as an empty object.
 - **A parsed body that is neither an object nor an array** is `Request body
   must be a JSON object or array`.
 
@@ -461,15 +478,19 @@ such as `42`**, `Unexpected token '4', "42" is not valid JSON`.
 A body over `BODY_LIMIT` is `413` (`request entity too large`); an
 unsupported `Content-Encoding` is `415`.
 
-Emptiness is judged on the bytes the parser actually consumed, not on the
-parsed value and not on the framing headers alone — `express.json()` turns a
-zero-length payload into `{}`, and a chunked message declares no length — so
-an empty payload and a literal `{}` are distinguished under every framing.
+Emptiness is judged on the parsed value, which is the only thing the endpoint
+sees: two in-memory checks run, the media type and then the shape, and nothing
+inspects the request stream or the framing headers on their own.
 
 ```bash
-# 400 -- no payload at all, even with the JSON media type declared
+# 400 -- no payload framing at all, so the media type has nothing to describe
 curl -s -X POST http://localhost:3000/api/v1/echo \
   -H 'Content-Type: application/json'
+# {"error":{"status":400,"message":"Request Content-Type must be application/json","requestId":"..."}}
+
+# 400 -- a literal empty object, indistinguishable from an absent payload
+curl -s -X POST http://localhost:3000/api/v1/echo \
+  -H 'Content-Type: application/json' -d '{}'
 # {"error":{"status":400,"message":"Request body is required","requestId":"..."}}
 
 # 400 -- a zero-length payload, the same reason
@@ -742,22 +763,20 @@ stale.
 **Why a metadata-changing reload needs its own save**, since this is the row
 most easily dismissed: `pm2 reload ecosystem.config.js --update-env` updates
 each live process's environment and field values in the running daemon, while
-`dump.pm2` is rewritten only by `pm2 save`. Measured with PM2 7.0.4 on a
-single-worker application: starting with an environment key set to `v1` and
-saving, then changing it to `v2` in the descriptor and reloading, left the
-process running `v2` while the snapshot still read `v1` — and a
-`pm2 kill && pm2 resurrect`, which is what a reboot does, brought the process
-back on `v1`. Running `pm2 save` after the reload made `v2` survive the same
-cycle. **A deploy that changes `NODE_ENV`, `instances`, a timeout, or any
-other descriptor value therefore ends with `pm2 save`,** or the change lasts
-only until the host restarts.
+`dump.pm2` is rewritten only by `pm2 save`. The two therefore diverge the
+moment a reload changes a value: the live processes carry the new one, the
+snapshot still carries the one written at the last save, and a resurrection
+replays the saved one. **A deploy that changes `NODE_ENV`, `instances`, a
+timeout, or any other descriptor value therefore ends with `pm2 save`,** or
+the change lasts only until the host restarts.
 
-The topology cases were reproduced the same way. Saving with two workers
-online and then scaling to three left the snapshot at **two** entries, so what
-a resurrection restores is two. Deleting the application without a forced save
-left its entries in the snapshot, and `pm2 resurrect` then brought those
-workers **back** — a service that had been deliberately retired, running
-again. Neither is reported as an error, which is why the save belongs in the
+The topology cases follow from the same split. The saved list holds one entry
+per saved worker, so a scale that is not saved is not restored: what a
+resurrection brings up is the worker count the snapshot held when it was last
+written. And a delete without `pm2 save --force` leaves the retired
+application's entries in the snapshot, so a resurrection starts those workers
+**again** — a service that had been deliberately retired, running. Neither
+condition is reported as an error, which is why the save belongs in the
 procedure rather than in a footnote. If you are unsure whether the snapshot
 matches reality, read it — it holds one entry per saved worker, so counting
 the entries for this application tells you the count a reboot would restore:
@@ -828,11 +847,145 @@ than to the application.
 This is the **first** step of any deployment, before `npm ci --omit=dev`. A
 host without it has no supervisor, and every `pm2:*` script fails.
 
+The two versions are fixed — PM2 **7.0.4** and `pm2-logrotate` **3.0.0** — and
+both are installed globally on the host rather than declared in
+`server/package.json`, for the reasons in [section 2](#2-prerequisites).
+**Pinning those two versions does not pin what they install**, and that is the
+whole of this step's difficulty:
+
+- **PM2 7.0.4 depends on `js-yaml` 4.3.1 exactly**, and that release is
+  affected by GHSA-2883-xcg3-v3hh (CVE-2026-84375): repeated empty YAML merge
+  sources force quadratic CPU work. It is fixed in 4.3.2, the highest 4.x. The
+  dependency is an exact version rather than a range, so every install
+  resolves the affected release, and `npm audit fix --force` offers only to
+  downgrade PM2 to 5.3.1, which is not this supervisor.
+- **`pm2-logrotate` 3.0.0 declares `pm2: "latest"` and `pmx: "latest"`**, plus
+  caret ranges for `graceful-fs`, `node-schedule` and `moment-timezone`. And
+  `pm2 install <name>` runs `npm install` under `$PM2_HOME/modules/<name>`
+  behind a wrapper manifest of its own making —
+  `{"dependencies":{"pm2-logrotate":"^3.0.0"}}`, a caret, so even the module
+  root floats on the next reinstall. A bare `pm2 install pm2-logrotate@3.0.0`
+  therefore resolves a different tree on a different host or a different day
+  — and **starts it**, so the unreviewed tree is already running by the time
+  anything could check it. Checking afterwards does not undo that.
+
+So the order below matters as much as the versions. PM2 is installed globally
+and then has its one affected package replaced, before PM2 is used for
+anything; the module arrives as an artefact whose entire closure was resolved
+and reviewed on a host you trust, so nothing unreviewed ever resolves or runs
+on the deployment host. Every artefact is a genuine registry package, which
+is what lets you check it against the registry's own integrity hash.
+
+**Step 1 — install PM2 globally.** The first command of any deployment.
+
 ```bash
 npm install -g pm2@7.0.4
-pm2 install pm2-logrotate@3.0.0
 pm2 --version    # 7.0.4
 ```
+
+PM2 7.0.4 declares no `preinstall`, `install` or `postinstall` script, so this
+unpacks the package without executing any of it. The affected parser is on
+disk and unused; step 2 removes it before PM2 does any work.
+
+**Step 2 — replace `js-yaml` with the fixed release.** `npm pack` fetches the
+genuine registry tarball, so you can compare its hash with the registry's own
+before anything is unpacked; the loop then replaces every copy under the
+global PM2 tree.
+
+```bash
+PM2_ROOT="$(npm root -g)/pm2"
+npm pack js-yaml@4.3.2                        # the registry artefact
+sha256sum js-yaml-4.3.2.tgz                   # record it
+npm view js-yaml@4.3.2 dist.integrity         # the registry's own sha512
+find "$PM2_ROOT" -type d -name js-yaml | while read -r d; do
+  sudo rm -rf "$d" && sudo mkdir -p "$d"
+  sudo tar xzf js-yaml-4.3.2.tgz -C "$d" --strip-components 1
+done
+```
+
+Then confirm nothing below 4.3.2 survives and PM2 still runs:
+
+```bash
+find "$PM2_ROOT" -type d -name js-yaml \
+  -exec node -p "require('{}/package.json').version" \;   # every line 4.3.2+
+pm2 --version                                             # 7.0.4
+```
+
+**Do not substitute `npm install js-yaml@4.3.2 --prefix "$PM2_ROOT"`.** That
+treats the global package as a project and re-resolves PM2's whole dependency
+set from the registry — trading a known tree for an unreviewed one — and
+leaves `npm ls` calling the result `invalid`, because PM2's own manifest still
+names 4.3.1. Replacing the one directory changes one package and nothing else.
+
+**Step 3 — build the logrotate artefact once, on a host you trust.** This is
+the only place the module's dependency tree is resolved, and `--ignore-scripts`
+means nothing in it runs even here.
+
+```bash
+npm pack pm2-logrotate@3.0.0                  # the registry artefact
+mkdir -p build/module
+tar xzf pm2-logrotate-3.0.0.tgz -C build/module --strip-components 1
+node -e '
+const fs = require("fs"), p = "build/module/package.json";
+const m = JSON.parse(fs.readFileSync(p, "utf8"));
+m.dependencies.pm2 = "7.0.4";              // was "latest"
+m.overrides = { "js-yaml": "^4.3.2" };     // transitive here, so legal
+fs.writeFileSync(p, JSON.stringify(m, null, 2) + "\n");
+'
+npm install --prefix build/module --ignore-scripts
+npm ls --prefix build/module js-yaml --all    # js-yaml@4.3.2 under pm2@7.0.4
+npm audit --prefix build/module               # found 0 vulnerabilities
+tar czf pm2-logrotate-3.0.0-vetted.tar.gz -C build module
+sha256sum pm2-logrotate-3.0.0-vetted.tar.gz   # record it for step 4
+```
+
+Two details in that manifest edit are not interchangeable. `pm2` is a **direct**
+dependency of the module, and npm rejects an `overrides` entry that contradicts
+one (`EOVERRIDE`), so its specification is rewritten instead; `js-yaml` arrives
+through PM2, so an override is the right instrument for it. `pmx` keeps its
+`latest` specification and is resolved once, here — what pins it on every host
+is the artefact, not the specification.
+
+**Step 4 — install the module from that artefact on each deployment host.** No
+`sudo`: `$PM2_HOME` belongs to the user PM2 runs as.
+
+```bash
+sha256sum pm2-logrotate-3.0.0-vetted.tar.gz   # must equal step 3's value
+pm2 install ./pm2-logrotate-3.0.0-vetted.tar.gz
+```
+
+PM2 recognises a tarball and takes its **TAR module** path: it unpacks the
+archive into `$PM2_HOME/modules/pm2-logrotate` and starts the app the package
+declares, **running no package manager at all**. What runs is the closure you
+reviewed, the registry is never consulted here, and the floating
+specifications above are never resolved on this host. PM2 records the module
+under `tar-modules` in `$PM2_HOME/module_conf.json` and relaunches it whenever
+the daemon starts, so this survives a restart and a reboot without repeating.
+
+**Step 5 — verify the closure on the host before going further.**
+
+```bash
+MOD="${PM2_HOME:-$HOME/.pm2}/modules/pm2-logrotate"
+pm2 --version                                 # 7.0.4
+npm ls --prefix "$MOD" js-yaml --all          # pm2@7.0.4 overridden -> 4.3.2
+npm audit --prefix "$MOD"                     # found 0 vulnerabilities
+pm2 ls                                        # pm2-logrotate 3.0.0, online
+find "$(npm root -g)/pm2" -type d -name js-yaml \
+  -exec node -p "require('{}/package.json').version" \;   # every line 4.3.2+
+```
+
+**A `js-yaml` below 4.3.2 in either tree, or a non-zero `npm audit`, means the
+host is not running what was reviewed.** Redo step 2, or reinstall the module
+from its artefact — an artefact you can hash is the only thing here that a
+later check can be held against.
+
+**Standing restriction: PM2 parses only the committed JavaScript descriptor.**
+Point it at `ecosystem.config.js` and nothing else. Do not give PM2 a YAML
+ecosystem file, do not hand it a descriptor from an untrusted source, and do
+not let it read configuration a caller can influence. The CLI's YAML path
+stays reachable whatever version of `js-yaml` sits underneath it, so this
+restriction is what protects a host where step 2 has not been done, and
+remains the correct practice on one where it has.
 
 ### 8.2 Configure log retention
 
@@ -847,6 +1000,12 @@ pm2 set pm2-logrotate:retain 7
 pm2 set pm2-logrotate:compress true
 pm2 set pm2-logrotate:rotateInterval '0 0 * * *'
 ```
+
+**These four commands establish the policy; they do not confirm it.** A
+freshly installed module starts at `retain 30` and `compress false`, so a host
+that skips this step keeps far more, uncompressed, than this policy asks for.
+Read the settings back from `$PM2_HOME/module_conf.json` if you need to know
+what a host is actually running.
 
 What those four settings actually do, because the arithmetic is not obvious:
 
@@ -882,7 +1041,20 @@ du -sh logs/                       # total the service's log directory
 ls -l logs/                        # the live files and their archives
 ```
 
-Lower `max_size` or `retain` if that total is more than the host can spare.
+**If that total is more than the host can spare, do not begin by shortening
+the window.** In order of preference: give the log directory more disk, or
+ship the records off the host — a copy in a log store or an object bucket is
+history this policy can no longer lose. Reducing `max_size` or `retain`
+locally is the last resort, and it takes three things: an explicit retention
+minimum from whoever owns the incident-response and audit requirement, rather
+than a figure chosen to fit the disk; confirmation that the history being
+given up is already shipped or archived elsewhere; and an equivalent bounded
+policy left in place afterwards, with both settings still set and neither at
+zero.
+
+**A reduction is not recoverable.** A shorter window means an investigation,
+or an audit request, reaches exactly that far back and no further, and a file
+that has rotated out of `retain` is gone from this host.
 
 A host that already runs the system `logrotate` may instead apply an
 equivalent policy to `server/logs/*.log`, in which case it **must** use
@@ -895,11 +1067,11 @@ Leaving the question open is not.
 Without this the service does not come back after a host reboot. PM2 keeps
 processes alive, but nothing keeps PM2 alive across a restart.
 
-This is five steps, and **step 2 is the one that is easy to miss: `pm2 startup`
-run without privilege installs nothing.** It prints a command and exits with
-an error, and unless you run the command it printed, no startup unit exists —
-the service will simply be gone after the next reboot, with nothing having
-reported a failure.
+This is five steps, and **step 2 is the one that is easy to miss:
+`pm2 startup` run without privilege installs nothing.** It prints a command
+and exits with an error, and until step 2 has been done no startup unit
+exists — the service will simply be gone after the next reboot, with nothing
+having reported a failure.
 
 **Step 1 — ask PM2 what to run.**
 
@@ -908,8 +1080,9 @@ pm2 startup
 ```
 
 Run as an unprivileged user, this detects the init system and prints the
-command that does the actual work — verified output, with this host's paths
-and user in place of yours:
+command that would do the actual work. **Treat that line as input to inspect,
+not as a command to paste** — step 2 says why. Its shape, with the installing
+host's paths and user in place of yours:
 
 ```text
 [PM2] Init System found: systemd
@@ -921,39 +1094,121 @@ sudo env PATH=$PATH:/usr/local/bin /usr/lib/node_modules/pm2/bin/pm2 startup sys
 of step 1, not a failure to work around — and it is why stopping here leaves
 you with no boot persistence at all.
 
-**Step 2 — run the exact command it printed.** Copy it verbatim from your own
-terminal; do not retype the example above. Every part of that line is
-host-specific: the first path is the directory holding your `node` binary, the
-second is your PM2 CLI, and `-u <user>` / `--hp <home>` are what make the
-generated unit start PM2 as the right user with the right `PM2_HOME`.
+**Step 2 — build the privileged command from the printed one, with a `PATH`
+you chose.** Two things in that line are host-specific and worth taking from
+it: the absolute path of your PM2 script, and the `-u <user>` / `--hp <home>`
+values that make the generated unit start PM2 as the right user with the right
+`PM2_HOME`. **Do not take its `PATH=$PATH`.** The PM2 CLI begins
+`#!/usr/bin/env node`, so the privileged process resolves `node` through
+whatever `PATH` it is handed: one user-writable directory anywhere on that
+list is enough for a `node` planted there to run as root (CWE-426, CWE-427).
+And the exposure does not end with this one command — PM2 writes the `PATH` it
+was given into the unit it generates (`Environment=PATH=…`) and starts PM2
+from it (`ExecStart=… resurrect`), so root re-resolves `node` through that
+same list at **every boot**.
+
+So decide the `PATH` first, then verify every directory on it before handing
+any of them to root. **The rule is root-owned and writable by no one else** —
+group-writable is as good as world-writable to a member of that group, and a
+writable *parent* lets the directory itself be replaced, so both are tested
+here, and every ancestor with them. Any output disqualifies the path it names:
 
 ```bash
-sudo env PATH=$PATH:/usr/local/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -u deploy --hp /home/deploy
+SAFE_PATH=/usr/local/bin:/usr/bin:/bin        # the list, decided once
+PM2_BIN="$(npm root -g)/pm2/bin/pm2"          # the absolute vetted script
+
+# Each directory on that PATH, and every ancestor of it.
+for d in $(printf '%s' "$SAFE_PATH" | tr ':' ' '); do
+  p="$d"
+  while :; do
+    find -L "$p" -maxdepth 0 \( -perm -0002 -o -perm -0020 -o ! -user root \) \
+      -printf 'UNSAFE %p\n'
+    [ "$p" = / ] && break
+    p="$(dirname "$p")"
+  done
+done
+
+# The interpreter that PATH actually selects — resolved under that PATH, not
+# under yours — and the CLI script, since a root-owned directory can still
+# hold a link to a binary someone else owns.
+NODE_BIN="$(PATH="$SAFE_PATH" command -v node)"
+stat -Lc '%A %U:%G %n' "$NODE_BIN" "$PM2_BIN"
+find -L "$NODE_BIN" "$PM2_BIN" \
+  \( -perm -0002 -o -perm -0020 -o ! -user root \) -printf 'UNSAFE %p\n'
 ```
+
+Nothing may be reported. If the interpreter itself comes back owned by a
+non-root user — which happens on hosts where Node was unpacked as an ordinary
+user — fix that before going further: chown it to `root:root`, or install a
+root-owned Node and put its directory on `SAFE_PATH` instead. Then run the
+registration with that `PATH` and that absolute script, and nothing else:
+
+```bash
+sudo env PATH="$SAFE_PATH" "$PM2_BIN" \
+  startup systemd -u deploy --hp /home/deploy
+```
+
+Substitute your own user and home; keep the `PATH` to exactly what you
+checked. It exists only so root can find `node` and this script — nothing on
+it needs to be a place users can write.
 
 On success PM2 reports the unit it wrote and the commands it ran — for systemd
 that is `/etc/systemd/system/pm2-<user>.service` followed by
 `systemctl enable pm2-<user>` — and finishes by telling you to freeze the
 process list, which is step 5 below.
 
-If you are already root, `pm2 startup` performs steps 1 and 2 in one go and
-prints the same unit path. **Pass the user and home explicitly in that case** —
-`pm2 startup systemd -u root --hp /root` — because PM2 derives the unit name
-from `$USER`, and a root shell with `$USER` unset yields a unit called
-`pm2-undefined`.
+If you are already root, `pm2 startup` performs steps 1 and 2 in one go — and
+that convenience is where the `PATH` rule is most easily lost, because a root
+shell's own `PATH` is then the one that reaches the unit. **Run it with the
+same checked `PATH` and the same absolute script, and pass the user and home
+explicitly**, since PM2 derives the unit name from `$USER` and a root shell
+with `$USER` unset yields a unit called `pm2-undefined`:
 
-**Step 3 — verify the unit exists and is enabled.** Do not take the previous
-step's output as proof:
+```bash
+env PATH="$SAFE_PATH" "$PM2_BIN" startup systemd -u root --hp /root
+```
+
+**Step 3 — verify the unit exists, is enabled, and runs in the environment you
+intended.** Do not take the previous step's output as proof:
 
 ```bash
 systemctl is-enabled pm2-deploy      # -> enabled
 systemctl status pm2-deploy --no-pager | head -5
 cat /etc/systemd/system/pm2-deploy.service
+grep -E '^Environment=PATH=|^ExecStart=' \
+  /etc/systemd/system/pm2-deploy.service
 ```
 
 Substitute the `-u` value from step 2 for `deploy`. If `is-enabled` reports
 `disabled` or the unit is not found, step 2 did not take effect — re-run it
 and read its output.
+
+**Then read the two lines the `grep` prints and hold them to step 2's rule.**
+`Environment=PATH=` is assembled from the `PATH` PM2 was handed plus a fixed
+system list, so anything that reached the command reached the unit: it must
+contain only directories verified as root-owned and not world-writable, and a
+duplicate entry is harmless where a user-writable one is not.
+`ExecStart=` names the script root runs at boot, and if it names the script
+alone, the unit's `PATH` is what decides which `node` executes it.
+
+Correcting either is an edit to the unit file followed by a reload:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+**A reload is all it needs — do not `systemctl restart pm2-<user>`.** The unit
+executes only at boot, and PM2 generates it with `ExecStop=… kill` and
+`ExecStart=… resurrect`, so restarting the unit is the daemon-wide stop and
+snapshot replay this section prohibits below, reached by another route.
+
+**Pinning `ExecStart` to the absolute interpreter as well as the absolute
+script removes boot-time resolution altogether.** The pinned form is
+`<NODE_BIN> <PM2_BIN> resurrect` — both absolute, both the paths step 2
+verified, so on a typical host
+`/usr/local/bin/node /usr/lib/node_modules/pm2/bin/pm2 resurrect`. After that
+nothing on the unit's `PATH` chooses the `node` that runs as root. Re-run the
+`grep` after the reload to confirm what the unit holds.
 
 **Step 4 — have the application running.** The saved list in step 5 is a
 snapshot of what is running now, so start the service first if it is not
@@ -974,8 +1229,45 @@ The unit from step 2 runs `pm2 resurrect` at boot, which replays exactly that
 file. This is also why every later topology change needs its own save — see
 [what needs a `pm2 save`](#what-needs-a-pm2-save-and-what-does-not).
 
-**Verify the whole chain before you rely on it.** The only conclusive test is
-a reboot: restart the host, then confirm the workers came back.
+**Verify the chain — the non-destructive checks first, and always.** Both
+halves of it can be read without disturbing anything, and between them they
+catch the failures that actually happen:
+
+```bash
+systemctl is-enabled pm2-deploy      # -> enabled
+cat /etc/systemd/system/pm2-deploy.service
+jq -r 'group_by(.name)[] | "\(.[0].name): \(length) saved worker(s)"' \
+  "${PM2_HOME:-$HOME/.pm2}/dump.pm2"
+```
+
+That establishes the unit half — a unit exists, it is enabled, and its
+`User=`, `Environment=PM2_HOME=`, `Environment=PATH=` and `ExecStart=` are the
+ones you intended — and the snapshot half:
+`dump.pm2` describes the application and worker count you expect back.
+**What it cannot establish is that the boot works.** Whether the init system
+starts the unit at the right point, whether the environment baked into it is
+still enough for root to find `node`, and whether something later in boot
+interferes are all outside what any file can tell you. Only a real restart
+settles those, which is why the reboot below remains the conclusive test —
+and why it is not the first thing to try.
+
+**A reboot is conclusive and disruptive in equal measure.** Run it on a
+staging or disposable host that mirrors the production configuration — same
+unit, same user, same `PM2_HOME`, same descriptor — and the question is
+answered with nothing at stake. That is the default, and for most hosts it
+is the whole of this test.
+
+**Rebooting a production host takes down every service on it, not just this
+one.** All of the following belong in place first:
+
+- authorisation for the work from whoever owns the host;
+- a scheduled maintenance window to do it inside;
+- verified redundancy — another host serving the same traffic, or downtime
+  explicitly accepted for this window;
+- a review of every other workload on the host, since PM2 is rarely the only
+  thing running and the machine's other tenants did not ask for this restart;
+- a rollback expectation: if the workers do not come back, `npm run pm2:start`
+  restores service by hand, and steps 1 to 3 are where the fault will be.
 
 ```bash
 sudo systemctl reboot
@@ -984,9 +1276,21 @@ npm run pm2:status                   # two workers, online, restarts 0
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/health
 ```
 
-If a reboot is not available, `pm2 kill && pm2 resurrect` exercises the
-snapshot half of the chain but **not** the unit half, so it does not
-substitute for the test above.
+**`pm2 kill && pm2 resurrect` is not the fallback for a host you cannot
+reboot.** `pm2 kill` stops the PM2 daemon and with it **every application and
+module that daemon manages** — other services, `pm2-logrotate`, all of it —
+not only this one. `pm2 resurrect` then replays whatever `dump.pm2` last
+recorded, so it can also put back configuration that was deliberately changed
+or restart an application that was deliberately retired
+([what needs a `pm2 save`](#what-needs-a-pm2-save-and-what-does-not)). On a
+shared or production daemon that is a multi-application outage with a
+configuration rollback attached: **do not run it there.** Where it is used at
+all it belongs on a disposable or staging host, or under a `PM2_HOME` that
+holds nothing but this service; read `dump.pm2` with the `jq` above first, so
+you know what the resurrection will replay; and treat it as the same
+authorised, windowed work as a reboot. Even then it exercises the snapshot
+half of the chain and **not** the unit half, so it does not substitute for the
+test above.
 
 A host that prefers to own the handoff with its own service manager may skip
 `pm2 startup` and register its own unit invoking `pm2 resurrect` at boot, with
@@ -1034,7 +1338,8 @@ three must be handled:
 
 **In production the process writes raw NDJSON**: one JSON object per line on
 stdout, which PM2 captures into `logs/out.log`. Configuration-failure output
-goes to stderr, captured into `logs/error.log`. Outside production
+goes to the process's standard error, which PM2 captures into
+`logs/error.log`. Outside production
 `pino-pretty` renders human-readable text instead, so **the NDJSON guarantee
 is scoped to production**.
 
@@ -1078,7 +1383,8 @@ line at a time:
 # everything correlated with one request id -- note the two paths
 jq -c 'select(.req.id == "3f1c..." or .requestId == "3f1c...")' logs/out.log
 
-# every server error (5xx and fatal), with the fields worth seeing
+# every error- and fatal-level record: 5xx access and exception records, plus
+# lifecycle failures such as a listener error or an exhausted drain budget
 jq -c 'select(.level >= 50) | {time, level, msg, id: (.req.id // .requestId)}' logs/out.log
 
 # which worker served what
@@ -1108,24 +1414,50 @@ any logger exists. It has `level` — the string `"fatal"`, not pino's numeric
 start-up failure it was: `ERR_CONFIG_VALIDATION`, which also carries
 `failures`, or `ERR_CONFIG_BOOTSTRAP`, which carries `stack` instead. It has
 **no `instance` and no `service`**, so a filter requiring either will skip it,
-and it goes to stderr rather than stdout. [Section
-11](#11-troubleshooting) shows one in full.
+and it goes to the process's standard error rather than stdout — which under
+PM2 means `logs/error.log`. [Section 11](#11-troubleshooting) shows one in
+full.
 
-**`logs/error.log` is expected to be empty in a clean run.** pino writes
-records at *every* level to stdout, so `out.log` carries the whole stream,
-`error`- and `fatal`-level records included, so `out.log` carries the whole
-stream. Exactly two records bypass it and go to stderr: the pre-logger
-configuration-failure record from [section 11](#11-troubleshooting), and an
-`ERR_TERMINAL_FLUSH` record if the log destination reported a failure, or did
-not drain inside its bound, while the process was exiting. Both are written
-straight to file descriptor 2 — and in the shipped `cluster` topology a
-worker's descriptor 2 belongs to the PM2 daemon, while `error_file` is filled
-from the `process.stderr` stream, so both land in `pm2 logs`
-(`$PM2_HOME/pm2.log`) rather than in `error.log`. An `ERR_TERMINAL_FLUSH`
-record wherever it appears is a real log-durability failure — the closing
-records of that run may be missing — and is worth investigating rather than
-filtering out. Service records appearing in `error.log` mean the logger's
-stream configuration has changed, not that the service is failing.
+**`logs/error.log` is expected to be empty in a clean run, and it has exactly
+one job when it is not.** pino writes records at *every* level to stdout, so
+`out.log` carries the whole stream, `error`- and `fatal`-level records
+included. Precisely one record bypasses it: the pre-logger
+configuration-failure record from [section 11](#11-troubleshooting), which is
+written before any logger exists and therefore cannot use the stdout stream.
+It goes to the process's standard error, which is the stream PM2 collects into
+`error_file`, so **under PM2 it lands in `logs/error.log`** — the file this
+descriptor declares and this runbook tells you to read. Run directly, with
+nothing owning standard error, the same record goes straight to file
+descriptor 2 and appears on your terminal.
+
+Nothing else uses that route. A terminal-flush failure — the log destination
+reporting an error, or failing to report inside the remaining drain budget,
+while the process was exiting — is *attempted* through the ordinary stdout
+logger as an `error`-level record carrying `code: "ERR_TERMINAL_FLUSH"`, aimed
+at `out.log` like everything else, **and the process exits non-zero even when
+the drain itself had succeeded.**
+
+Read that order of precedence carefully, because the record is the half that
+can go missing: the destination it is written to is the destination that just
+failed, and the process exits without establishing a second barrier for it, so
+it may be absent from `out.log` exactly when it would have been most useful.
+**The escalated non-zero exit status is the authoritative external signal.**
+From outside, a broken log destination therefore looks like a worker that
+exited non-zero on an ordinary `pm2 stop` with its closing lines absent from
+`out.log` — a `Drain started` with no `Drain complete; exiting` to match it,
+even though the drain itself finished.
+
+The same absence has one innocent cause worth knowing before you go looking:
+when a drain runs all the way to `SHUTDOWN_TIMEOUT_MS` and is forced, the
+budget is spent, so the closing record is handed to the destination without
+waiting for its report and may not reach the file. That case announces itself
+— `Drain budget exhausted; forcing exit` is written before the force, and the
+exit is non-zero because the drain overran, not because logging broke. Any
+other non-zero exit with missing closing records is a real log-durability
+failure, and is worth investigating rather than filtering out.
+Service records other than the configuration-failure one appearing in
+`error.log` mean the logger's stream configuration has changed, not that the
+service is failing.
 
 **`time: false` in the descriptor is deliberate.** PM2's `time: true` would
 prefix every captured line with a human-readable timestamp, and that prefix
@@ -1177,11 +1509,20 @@ plain integers and the process figures are read from `process` at render time:
 | `process_resident_memory_bytes` | gauge | Resident set size of this worker |
 | `process_cpu_seconds_total` | counter | User plus system CPU time consumed by this worker |
 
-Every sample carries the process identity — `service="hello-world-service"`
-and `instance="<n>"`, the same pair as the `GET /health` payload and every log
-line ([section 4](#4-configuration)) — and the status-class family adds
-`status_class` on top of it. Six families, ten sample lines, and the identity
-adds no series: one process has one identity.
+No sample carries an identity label. The only label anywhere in the
+exposition is `status_class` on the status-class family, which leaves the
+whole surface at six families and ten sample lines per scrape. That is
+deliberate on two counts: the counter store is a dependency-free leaf that
+reads no configuration and no environment, and the exposition is minimised
+to counts and process figures so an unauthenticated scrape discloses
+neither the service identity nor the worker topology. The service name and
+the instance ordinal are carried by the `GET /health` payload and by every
+log line instead ([section 4](#4-configuration)).
+
+So a scrape cannot be attributed to a particular worker — nothing in the
+document names the process that answered it. That is the shared-socket
+limitation **Counters are per-worker** below describes, and the absent
+label makes it matter more rather than less.
 
 `http_requests_total` is incremented when a request is **accepted** and the
 status-class buckets when its response **completes**. Both moves are
@@ -1283,10 +1624,12 @@ PORT=abc LOG_LEVEL=warn TRUST_PROXY=maybe npm start 2>&1 >/dev/null | jq -r '.fa
 
 A validation failure is deliberately not a stack trace. It happens before any
 logger exists, which is exactly when a legible message matters most, so this
-one record is written synchronously to file descriptor 2 with no logger and no
-transport. Read `failures` for the structured list, `err` for the one-line
-summary, and check the value of each named variable against the table in
-[section 4](#4-configuration).
+one record is written to the process's standard error with no logger and no
+transport — synchronously to file descriptor 2 when nothing owns that stream,
+and through the stream itself when a supervisor does, so that PM2 files it
+where the descriptor says it goes. Read `failures` for the structured list,
+`err` for the one-line summary, and check the value of each named variable
+against the table in [section 4](#4-configuration).
 
 **Read `code` before editing `server/.env`.** Only
 `ERR_CONFIG_VALIDATION` says the environment is at fault. `ERR_CONFIG_BOOTSTRAP`
@@ -1296,11 +1639,18 @@ and the fault is in the code or the dependency tree rather than in anything an
 operator set. Editing `.env` will not move it; read the `stack`.
 
 Under PM2 the same failure presents as a worker that restarts with widening
-backoff. In the shipped `cluster` topology the record does **not** reach
-`logs/error.log`: it is written straight to file descriptor 2, which in a
-cluster worker belongs to the PM2 daemon, while `error_file` is filled from
-the `process.stderr` stream. Read it with `npm run pm2:logs`, or find it in
-`$PM2_HOME/pm2.log`.
+backoff, and **the record is in `logs/error.log`** — one copy per restart
+attempt, each exiting non-zero:
+
+```bash
+head -1 logs/error.log | jq -r '.code, .failures[]'
+npm run pm2:logs                      # or watch both streams live
+```
+
+`logs/out.log` stays empty on that run, because the process never reached the
+logger. If `error.log` is empty too, the failure is not a configuration
+failure — look for a worker that started and then died, in
+[section 9](#9-reading-the-logs).
 
 ### `EADDRINUSE`, or a permission failure on bind
 
@@ -1411,23 +1761,20 @@ So the expected duration is roughly:
 instances x (DRAIN_DELAY_MS + close time) + replacement start-up
 ```
 
-With the defaults — two workers, `DRAIN_DELAY_MS=2000` — that is **a little
-over four seconds, and it is the correct behaviour**. A measured run on an
-idle host: the command returned in 4.6 s, with the first worker's
-`Drain started` at +0.3 s and `Drain complete` at +2.3 s, and the second
-worker's at +2.5 s and +4.5 s. Requests continued to be served throughout.
-Reducing `DRAIN_DELAY_MS` shortens it proportionally; raising `instances`
-lengthens it.
+With the defaults — two workers, `DRAIN_DELAY_MS=2000` — the formula puts it
+a little over four seconds, and **that is the correct behaviour rather than a
+symptom**: requests continue to be served throughout. Reducing
+`DRAIN_DELAY_MS` shortens it proportionally; raising `instances` lengthens
+it.
 
 **When it *is* the handshake.** A missing `ready` message costs an extra
-`listen_timeout` — eight seconds — **per worker**, because PM2 waits out the
-whole timeout before accepting the replacement and moving on, and it still
-reports success at the end. Measured against a worker deliberately built not
-to send `ready`, both with two workers: **`pm2 start` took 16 s** instead of
-under one, and **`pm2 reload` took 20 s** instead of 4.6 — that is the eight
-seconds and the two-second drain, twice. So the tell is roughly a fourfold
-reload and a start that is slow at all, since a healthy start does not pay the
-timeout.
+`listen_timeout` — 8000 ms in the descriptor — **per worker**, because PM2
+waits out the whole timeout before accepting the replacement and moving on,
+and it still reports success at the end. So the tell is arithmetic rather
+than a stopwatch reading: a reload that runs about
+`instances x listen_timeout` longer than the formula predicts, and a start
+that is slow at all, since a healthy start waits only for `ready` and never
+pays the timeout.
 
 Confirm it rather than infer it: a worker that sent `ready` logged
 `Service listening` on start-up, so a replacement with no such line is the
@@ -1438,10 +1785,11 @@ broken case.
 jq -r 'select(.msg | test("Service listening|Drain started|Drain complete")) | "\(.time) \(.pid) \(.msg)"' logs/out.log | tail -8
 ```
 
-Subtract the timestamps: gaps of about `DRAIN_DELAY_MS` between a worker's
-`Drain started` and `Drain complete` are the drain working as designed, while
-a gap of about eight seconds before a replacement appears is the handshake
-failing. See [the readiness handshake](#the-readiness-handshake).
+Subtract the timestamps: a gap of about `DRAIN_DELAY_MS` between a worker's
+`Drain started` and `Drain complete` is the drain working as designed, while a
+gap approaching `listen_timeout` before a replacement's `Service listening`
+appears is the handshake failing. See
+[the readiness handshake](#the-readiness-handshake).
 
 ### Production start-up fails on `pino-pretty`
 

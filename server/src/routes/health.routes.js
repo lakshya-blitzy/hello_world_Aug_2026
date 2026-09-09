@@ -14,32 +14,13 @@
  * `GET /health/ready`. Declaring `'/health'` here would produce
  * `/health/health`.
  *
- * WHAT THIS MODULE DELIBERATELY DOES NOT DO:
- *
- *   * It READS drain state; it never sets it. `beginShutdown()` belongs to
- *     `../server.js`'s signal handler alone, which is why only
- *     `isShuttingDown` is imported below. Calling the setter from here would
- *     let any HTTP client start a drain by polling a probe.
- *   * It writes no log line. Every request already produces exactly one
- *     access record from position 1 of the pipeline in `../app.js`, and a
- *     probe is ordinary traffic rather than an incident.
- *   * It formats no error. The 503 below is a normal response, not a failure
- *     -- see "WHY THE PROBE SHAPE IS FLAT" at the readiness route.
- *   * It sets no response header. `x-request-id`, helmet's security headers
- *     and compression are all applied by the pipeline before this router is
- *     reached, and the contract names no header of its own.
- *
- * CONSISTENCY OBLIGATION. `server/README.md`'s endpoint-reference table is the
- * canonical documentation of both contracts, and it instructs operators to
- * point a reverse-proxy health check at `/health/ready` rather than `/health`
- * -- precisely because readiness is the one that turns negative while the
- * process drains. Changing a status code or a body field here without
- * updating that table makes the runbook untrue.
+ * DRAIN STATE IS READ HERE, NEVER SET. Only `isShuttingDown` is imported
+ * below; `beginShutdown()` belongs to `../server.js`'s signal handler alone.
+ * Calling the setter from here would let any HTTP client start a drain by
+ * polling a probe.
  */
 'use strict';
 
-// `express` is required solely for `express.Router()` below; no other part of
-// its surface is used here.
 const express = require('express');
 
 // Only `isShuttingDown` is destructured, and the omission is deliberate:
@@ -58,27 +39,20 @@ const { isShuttingDown } = require('../lib/lifecycle');
 
 // WHY THIS MODULE REQUIRES `../config` INSTEAD OF READING THE ENVIRONMENT.
 // The liveness response carries the service name and the cluster instance,
-// and both are environment-derived values. `../config/index.js` is the
-// codebase's SOLE environment boundary: it is the only module permitted to
-// touch the `env` object on `process`, and an acceptance criterion greps
-// `server/src/` for that expression and requires exactly one matching file.
-// That criterion is also why this comment describes the expression rather
-// than spelling it out -- re-spelling it here would fail a mechanical check
-// without changing one line of behaviour, so please leave it described.
+// and both are derived from environment variables. `../config/index.js` is
+// the codebase's SOLE environment boundary: it is the only module that reads
+// the raw environment, validates it and freezes the result.
 //
-// A direct read would break the invariant and, worse, let this response drift
-// from what the logger reports: `../lib/logger.js` puts these same two values
-// on every log line through this same object, so a health response and a log
-// line disagreeing about which instance answered would be indistinguishable
-// from a routing bug.
+// Reading those two values anywhere else would break that boundary and, worse,
+// let this response drift from what the logger reports: `../lib/logger.js`
+// puts these same two values on every log line through this same object, so a
+// health response and a log line disagreeing about which instance answered
+// would be indistinguishable from a routing bug.
 //
-// The frozen configuration object is assigned directly by that module, so the
-// values are read as `config.serviceName` and `config.instance` -- never
-// `config.config.*`. There is deliberately no try/catch around this require:
-// the config module validates and throws once during its own module
-// evaluation, `../server.js` guards the first require of it and renders the
-// failure, and by the time this route module loads configuration is already
-// resolved and cached.
+// There is deliberately no try/catch around this require: the config module
+// validates and throws once during its own module evaluation, `../server.js`
+// guards the first require of it and renders the failure, and by the time
+// this route module loads configuration is already resolved and cached.
 const config = require('../config');
 
 /**
@@ -96,6 +70,62 @@ const config = require('../config');
  * @type {import('express').Router}
  */
 const router = express.Router();
+
+/**
+ * Writes one probe response: the status, the JSON body, the two headers that
+ * body determines, and the directive that keeps it out of caches.
+ *
+ * WHY THE PROBES DO NOT USE `res.json()`. `res.json()` delegates to
+ * `res.send()`, which evaluates conditional-request freshness before writing:
+ * on a GET it rewrites a 2xx to `304 Not Modified` and strips the body, and
+ * `If-None-Match: *` counts as fresh whether or not the response carries an
+ * ETag -- so disabling ETag generation in `../app.js` does not close that path
+ * on its own. A probe that answers `304` with no body to a client that sent
+ * one header is a probe whose contract does not hold: a poller cannot read a
+ * status it was never sent. `res.end()` performs no freshness test, so both
+ * answers below are exactly the status and body written here.
+ *
+ * WHY EVERY PROBE ANSWER IS `Cache-Control: no-store`. Not generating a
+ * validator stops a cache from REVALIDATING a stored copy; it does not stop it
+ * from storing one in the first place, and the two are different properties. A
+ * probe body is point-in-time process state whose whole value is that it
+ * describes this instant: a stored `{"status":"ready"}` replayed by an
+ * intermediary during a drain would report a worker as available precisely
+ * when it is being withdrawn, which is the failure the readiness probe exists
+ * to prevent. `no-store` forbids the storage rather than merely marking it
+ * stale, so it applies to the draining `503` exactly as to the healthy `200`
+ * -- a cached negative answer would be as wrong once the process is gone.
+ *
+ * Both probe responses go through this one function so that the two contracts
+ * cannot drift apart, and so the reasoning above is recorded once.
+ *
+ * @param {import('express').Response} res The response to write.
+ * @param {number} status The HTTP status to send: `200` or `503`.
+ * @param {object} payload The flat probe object to serialize. Key insertion
+ *   order is preserved by `JSON.stringify`, and it is the documented order.
+ * @returns {void} Nothing; the response is complete when this returns.
+ */
+function sendProbe(res, status, payload) {
+  const body = JSON.stringify(payload);
+
+  res.status(status);
+
+  // Both headers written verbatim through the raw setter, carrying the same
+  // values `res.json()` would derive, so a consumer sees no difference.
+  // Content-Length is safe against `compression()` at pipeline position 3:
+  // that middleware removes it whenever it compresses, and a probe body is far
+  // below its size threshold, so it is never compressed.
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Length', Buffer.byteLength(body));
+
+  // Set here rather than in `../app.js` because it is this contract's own
+  // property, not a cross-cutting one: the root response is a fixed constant
+  // that a cache may keep harmlessly, while these two bodies are only ever
+  // true of the instant they were written. Helmet emits no cache directive of
+  // its own, so nothing downstream overrides this.
+  res.setHeader('Cache-Control', 'no-store');
+  res.end(body);
+}
 
 /**
  * `GET /health` -- the liveness probe.
@@ -135,7 +165,7 @@ router.get('/', (req, res) => {
   // Key order is part of the documented contract rather than incidental:
   // JavaScript preserves object key insertion order through `JSON.stringify`,
   // and this is the order `server/README.md` and the HTTP contract publish.
-  res.status(200).json({
+  sendProbe(res, 200, {
     status: 'ok',
 
     // From configuration, never a string literal in this file. The same
@@ -186,15 +216,30 @@ router.get('/', (req, res) => {
  * `{ error: { status, message, requestId } }`, this flat probe object, and
  * Prometheus text at `/metrics`. The envelope is reserved for APPLICATION
  * FAILURES, and a service that is draining on an operator's instruction has
- * not failed -- it is doing exactly what it was told. Routing the 503 through
- * `../middleware/error-handler.js` would wrap it in that envelope, add a
- * message and a request id, and log an exception record for a planned,
- * expected event.
+ * not failed -- it is doing exactly what it was told. Three things follow
+ * from handing this 503 to `../middleware/error-handler.js`, and each is a
+ * reason not to:
  *
- * A probe's consumer -- a reverse proxy, a supervisor, a `curl` in a shell
- * loop -- matches on the status code plus a small, stable body. Keeping the
- * body to one field is what makes it cheap to match and impossible to
- * misparse, which is why nothing diagnostic is added to it either.
+ *   * SHAPE. A probe's consumer -- a reverse proxy, a supervisor, a `curl` in
+ *     a shell loop -- matches on the status code plus a small, stable body.
+ *     The handler replaces this one-field object with the three-field
+ *     envelope, so reading a drain state would mean parsing the shape
+ *     reserved for failures. One field is what makes the body cheap to match
+ *     and impossible to misparse, which is why nothing diagnostic is added to
+ *     it either.
+ *   * MESSAGE. That handler masks 5xx messages in production and sends
+ *     `Internal Server Error` in their place. A planned drain answered with
+ *     that message tells the caller something untrue, and no message attached
+ *     to an `HttpError` here would survive to correct it.
+ *   * RECORD. That handler is this service's failure path, and it records
+ *     every 5xx it resolves as a server-side failure. A drain the operator
+ *     asked for is not a failure, and filing it as one puts a planned event
+ *     into the record read to find faults.
+ *
+ * What does NOT differ is the access record from position 1 of the pipeline:
+ * `../middleware/request-context.js` maps any status of 500 or above to
+ * `error` level, so this direct 503 is recorded at that level exactly as a
+ * delegated one would be. The access record is not a reason either way.
  *
  * WHY THE 503 IS REACHABLE AT ALL.
  *
@@ -204,9 +249,12 @@ router.get('/', (req, res) => {
  * `DRAIN_DELAY_MS` (default 2000) before `server.close()`. That window is the
  * only time this 503 can be observed. Were the listener closed first, the
  * probe could not be answered at all: a poller would meet a refused
- * connection instead of a negative answer, and this contract would be
- * unreachable. The delay is therefore not padding, and shortening it to zero
- * would delete the behaviour this route exists to expose.
+ * connection instead of a negative answer. The default 2000 ms window is
+ * therefore what makes this answer observable rather than padding.
+ * `DRAIN_DELAY_MS=0` is a permitted setting -- `../config/index.js` floors
+ * the value at 0 -- and it does not break anything here; it removes the
+ * window, so a poller meets that refused connection instead of this negative
+ * answer.
  *
  * THE HONEST BOUND. Every PM2 cluster worker shares one listening socket, so
  * an external probe CANNOT choose which worker answers it. A 503 therefore
@@ -253,14 +301,11 @@ router.get('/ready', (req, res) => {
   // flipped by the signal handler at an arbitrary moment during the process's
   // life, so a value captured at require time would answer `200` forever.
   if (isShuttingDown()) {
-    res.status(503).json({ status: 'shutting_down' });
+    sendProbe(res, 503, { status: 'shutting_down' });
     return;
   }
 
-  res.status(200).json({ status: 'ready' });
+  sendProbe(res, 200, { status: 'ready' });
 });
 
-// The public surface is the Router itself and nothing else: no named helpers,
-// no configuration hook and no test-only export. `./index.js` consumes this
-// value directly, so the assignment must stay a bare Router.
 module.exports = router;

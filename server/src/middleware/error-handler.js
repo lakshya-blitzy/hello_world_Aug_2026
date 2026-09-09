@@ -3,46 +3,19 @@
  * The terminal error handler for the request pipeline.
  *
  * SINGLE RESPONSIBILITY. This module is the only place in the service where a
- * failure response is formatted. Every failure converges here -- the typed 404
- * from src/middleware/not-found.js, the HttpError(400) raised by
- * src/routes/api.routes.js on media type or body shape, a body-parser
- * rejection, an async handler's rejected promise, and an unexpected throw --
- * and every one of them leaves as the same
- * `{ error: { status, message, requestId } }` envelope. Nothing else in the
- * pipeline writes a failure body, which is what keeps that shape single and
- * every failure correlatable by request id.
+ * failure response is formatted, so every failure whose response has not yet
+ * begun -- a typed 404 or 400, a body-parser rejection, an async handler's
+ * rejected promise, an unexpected throw -- leaves as the same
+ * `{ error: { status, message, requestId } }` envelope. There is exactly one
+ * exception, and it is a supported path rather than a gap: a failure arriving
+ * after `res.headersSent` cannot have its response replaced, so it is recorded
+ * and then delegated to Express's default handler, which closes the connection
+ * with whatever was already on the wire.
  *
- * POSITION 8 OF 8, REGISTERED LAST. The pipeline src/app.js assembles is:
- *
- *   1 requestContext            (request id, access record, counters)
- *   2 helmet()                  (security headers)
- *   3 compression()             (response compression)
- *   4 express.json({ limit })
- *   5 express.urlencoded({ extended: false, limit })
- *   6 router tree + options.extraRouters
- *   7 notFound                  (unmatched path -> HttpError(404))
- *   8 THIS MODULE
- *
- * This module registers nothing and imports nothing from src/app.js: it
- * exports a handler, and app.js places it last. The position is part of the
- * contract rather than a stylistic ordering, because Express only dispatches
- * an error to middleware registered after the routes that raise it.
- *
- * WHAT THIS MODULE IS NOT. It is not the source of the
- * `503 { status: "shutting_down" }` that `GET /health/ready` answers while the
- * process drains. That body is deliberately a flat probe shape owned by
- * src/routes/health.routes.js, because a probe's consumer matches on the
- * status code plus a small stable body and has no use for an error envelope's
- * three fields. A reader who assumes every non-2xx in this service is built
- * here will look for that 503 in the wrong file.
- *
- * NO ASYNC SHIM, DELIBERATELY. Express 5 forwards a rejected promise from an
- * async handler to four-arity error middleware on its own -- the router awaits
- * what a handler returns and routes a rejection to `next` -- so a route needs
- * no try/catch wrapper and this service needs no `express-async-errors`
- * dependency. Adding either would be dead weight that also hides the mechanism
- * from the next reader, who would then have no way to tell which of the two
- * paths was actually carrying the error.
+ * POSITION 8 OF 8, REGISTERED LAST by src/app.js, which owns the pipeline
+ * listing. This module registers nothing and imports nothing from app.js. The
+ * position is contract rather than style: Express only dispatches an error to
+ * four-arity middleware registered after the routes that raise it.
  *
  * @module middleware/error-handler
  */
@@ -50,42 +23,26 @@
 'use strict';
 
 /*
- * The typed error class, required as the class itself because the module
- * exports the class itself (`module.exports = HttpError`). Destructuring the
- * import as `const { HttpError } = ...` would yield undefined, and
- * `err instanceof undefined` throws -- inside the pipeline's single exit,
- * which is the worst possible place for a throw.
- *
- * It is the FIRST branch of status resolution below: an HttpError is an error
- * whose raiser chose the status deliberately, so that status is honoured.
+ * `../lib/http-error` exports the bare class, so it is bound directly and used
+ * with `instanceof` as the first branch of status resolution below.
  */
 const HttpError = require('../lib/http-error');
 
 /*
- * The frozen configuration object, of which this file reads EXACTLY ONE field:
- * `isProduction`. Nothing else here is configurable, and that is the correct
- * boundary -- the statuses, the masked phrase and the envelope's shape are
- * protocol constants fixed by this service's HTTP contract, not operator
- * settings.
- *
- * WHY `config.isProduction` AND NEVER A STRING COMPARISON. The raw environment
- * is read in exactly one module in this codebase, src/config/index.js, which
- * is what makes an invalid environment one loud start-up failure instead of
- * several quiet disagreements. `isProduction` is derived there once precisely
- * so that this file and src/lib/logger.js cannot answer "are we in
- * production?" differently -- one masking 5xx messages while the other
- * attaches a development transport would be a contradiction nothing reports.
+ * The frozen configuration object. This file reads one field, `isProduction`,
+ * which decides whether a 5xx message is masked below.
  */
 const config = require('../config');
 
 /*
  * The one root pino logger, used here for a single purpose: the exception
- * record for the 500 class. Its redaction policy (`req.headers.authorization`,
- * `req.headers.cookie`) is configured at the root and inherited, so nothing
- * needs re-stating here; this module logs no headers and no bodies in any
- * case. Writing straight to the process streams is not an alternative --
- * stdout is the production newline-delimited JSON stream, and one non-JSON
- * line breaks any consumer parsing it line by line.
+ * record for the 5xx class -- every failure this handler resolves to a
+ * server-fault status, however it was raised. Its redaction policy and its
+ * allowlisting `err` serializer are configured at the root and inherited, which
+ * is what makes passing the raw delegated error below safe. Writing to the
+ * process streams directly is not an alternative: stdout is the production
+ * newline-delimited JSON stream, and one non-JSON line breaks any consumer
+ * parsing it line by line.
  */
 const logger = require('../lib/logger');
 
@@ -93,22 +50,18 @@ const logger = require('../lib/logger');
  * The response message sent for a 5xx in production, and the reason phrase
  * used when an error carries no usable message of its own.
  *
- * A protocol constant, deliberately not a configuration key: an operator who
- * could re-word it could also make a masked failure claim something untrue,
- * and the value has to match what the acceptance criteria assert byte for
- * byte.
- *
  * @type {string}
  */
 const INTERNAL_SERVER_ERROR_MESSAGE = 'Internal Server Error';
 
 /**
- * Lowest status treated as a server fault, and therefore the threshold for
- * production masking.
+ * Lowest status treated as a server fault, and therefore the boundary for both
+ * decisions this file takes on that class: production masking of the response
+ * message, and the exception record.
  *
- * It is NOT the threshold for the exception record. That record is gated on
- * whether the failure was unexpected, which the status cannot express -- see
- * `resolveFailure` and the record itself.
+ * One threshold rather than two because the two are halves of one policy -- a
+ * message masked out of the response has to survive in the log or it is lost,
+ * so whatever is masked is recorded.
  *
  * @type {number}
  */
@@ -121,6 +74,16 @@ const SERVER_ERROR_MIN_STATUS = 500;
  * @type {number}
  */
 const FALLBACK_STATUS = 500;
+
+/**
+ * Longest request path written to the exception record. The path is
+ * caller-controlled, so its length is bounded here for the same reason every
+ * other string this service logs is: one field in one record must not be able
+ * to become an unbounded log line.
+ *
+ * @type {number}
+ */
+const MAX_LOGGED_PATH_LENGTH = 512;
 
 /**
  * The range of statuses this handler is willing to send for a failure: the
@@ -212,18 +175,9 @@ function isSendableErrorStatus(status) {
 }
 
 /**
- * Resolves both the HTTP status a failure should produce and whether the
- * failure was expected, in strict precedence order: a typed `HttpError`'s own
- * status, then the parser allowlist keyed on `err.type`, then the masked
- * fallback.
- *
- * WHY THE ORIGIN IS RETURNED ALONGSIDE THE STATUS, AND NOT DERIVED FROM IT.
- * The status alone cannot say whether a failure was expected: a deliberate
- * `HttpError(503)` and an unexpected throw both resolve to the 5xx class, and
- * they are opposite kinds of event -- one is a decision this service made, the
- * other is a defect. The exception record below is reserved for the second,
- * and this function is the only place that still knows which branch was taken,
- * so it reports it rather than leaving the caller to guess from a number.
+ * Resolves the HTTP status a failure should produce, in strict precedence
+ * order: a typed `HttpError`'s own status, then the parser allowlist keyed on
+ * `err.type`, then the masked fallback.
  *
  * WHY AN UNRECOGNISED ERROR STAYS A 500. A bare `SyntaxError` -- or anything
  * else carrying no `err.type` -- did not come from the parser, so it is a
@@ -237,7 +191,7 @@ function isSendableErrorStatus(status) {
  * given, but nothing stops a later assignment, and an `instanceof` test says
  * nothing about the field's current value. An unusable status is therefore
  * treated as exactly what it is -- a defect in this service -- and resolves to
- * the unexpected fallback, which both keeps the envelope intact and records
+ * the fallback, which both keeps the envelope intact and, being a 5xx, records
  * the fault instead of letting it through as a response nobody can explain.
  *
  * `err.status` and `err.statusCode` on a NON-`HttpError` error are pointedly
@@ -249,19 +203,12 @@ function isSendableErrorStatus(status) {
  * @param {*} err The delegated failure. Typically an `Error`, but a handler is
  *   free to call `next()` with any truthy value, so nothing about its shape is
  *   assumed.
- * @returns {{ status: number, unexpected: boolean }} `status` is the value to
- *   send, and the one the masking decision is taken against. `unexpected` is
- *   true only for the fallback branch -- an unrecognised failure, or a typed
- *   one whose status cannot be sent -- and is what gates the exception record.
+ * @returns {number} The status to send, and the one both the production
+ *   masking decision and the exception record are taken against.
  */
 function resolveFailure(err) {
-  // Branch one: the raiser chose the status, so it is honoured -- once it has
-  // been confirmed sendable. This covers the 404 from not-found.js and every
-  // HttpError(400) from api.routes.js.
   if (err instanceof HttpError) {
-    return isSendableErrorStatus(err.status)
-      ? { status: err.status, unexpected: false }
-      : { status: FALLBACK_STATUS, unexpected: true };
+    return isSendableErrorStatus(err.status) ? err.status : FALLBACK_STATUS;
   }
 
   // Short-circuited rather than accessed directly: a handler may delegate a
@@ -274,10 +221,10 @@ function resolveFailure(err) {
   // would resolve to an inherited function and be handed to res.status(),
   // which throws. Only the five rows declared above may decide a status.
   if (typeof type === 'string' && Object.hasOwn(PARSER_STATUS_BY_TYPE, type)) {
-    return { status: PARSER_STATUS_BY_TYPE[type], unexpected: false };
+    return PARSER_STATUS_BY_TYPE[type];
   }
 
-  return { status: FALLBACK_STATUS, unexpected: true };
+  return FALLBACK_STATUS;
 }
 
 /**
@@ -285,11 +232,11 @@ function resolveFailure(err) {
  * masking to the server-fault class.
  *
  * WHY A 5xx MESSAGE IS MASKED IN PRODUCTION, AND WHY THE REAL ONE IS NOT LOST.
- * An unexpected failure's message is written by whatever actually failed -- a
- * parser, a library, a call three frames deep -- and can name an internal
- * path, a query or a host that a client has no business seeing and an attacker
- * can build on. It is replaced here, not discarded: the exception record in
- * `errorHandler` below carries the error itself, so the real message and stack
+ * A server-fault message is written by whatever actually failed -- a parser, a
+ * library, a call three frames deep -- and can name an internal path, a query
+ * or a host that a client has no business seeing and an attacker can build on.
+ * It is replaced here, not discarded: the exception record in `errorHandler`
+ * below is emitted for every status this masks, so the real message and stack
  * stay in the log, correlatable to this response by request id. Outside
  * production the real message IS returned, which is what makes local debugging
  * workable without tailing a log alongside every request.
@@ -323,8 +270,8 @@ function resolveMessage(err, status) {
 
 /**
  * The terminal error handler: turns every failure in the pipeline into this
- * service's one failure envelope, and records the ones that indicate a fault
- * in the service itself.
+ * service's one failure envelope, and writes an exception record for every
+ * failure it resolves to the 5xx class.
  *
  * POSITION 8 OF 8, AND LAST. It is registered by src/app.js after the router
  * tree and after `notFound`, so everything reaching it has already failed and
@@ -358,87 +305,76 @@ function resolveMessage(err, status) {
  * @param {*} err The delegated failure. An `HttpError` from `not-found.js` or
  *   `api.routes.js`, a body-parser error carrying `err.type`, a rejection from
  *   an async handler, or an unexpected throw. Any truthy value is accepted,
- *   because `next()` accepts any.
- * @param {express.Request} req The request. `id` supplies the envelope's
- *   `requestId`; `method` and `originalUrl` describe the failure in the log.
- * @param {express.Response} res The response. `headersSent` decides between
- *   sending and delegating; the envelope is sent through it.
- * @param {express.NextFunction} next Used on exactly one path -- when headers
- *   are already sent -- and it must never be removed: dropping it changes the
- *   function's arity and, per the note above, silently unregisters this handler
- *   as an error handler altogether.
+ *   because `next()` accepts any. A rejection arrives here with no try/catch
+ *   and no shim in the chain: Express 5 forwards a rejected promise from an
+ *   async handler to four-arity error middleware itself, which is why this
+ *   service declares no `express-async-errors` dependency.
+ * @param {import('express').Request} req The request. `id` supplies the
+ *   envelope's `requestId`; `method` and `path` -- the pathname, never the
+ *   query string -- describe the failure in the log.
+ * @param {import('express').Response} res The response. `headersSent` decides
+ *   between sending and delegating; the envelope is sent through it.
+ * @param {import('express').NextFunction} next Used on exactly one path --
+ *   when headers are already sent -- and it must never be removed: dropping it
+ *   changes the function's arity and, per the note above, silently unregisters
+ *   this handler as an error handler altogether.
  * @returns {void} Nothing is returned; the outcome is the response sent or the
  *   error delegated.
  */
 function errorHandler(err, req, res, next) {
-  // Resolved once and reused. The status decides the masking and the response,
-  // and re-deriving it at each use is how two of those decisions come to
-  // disagree about the same failure. `unexpected` travels with it because the
-  // record below is about the KIND of failure, which the status cannot express.
-  const { status, unexpected } = resolveFailure(err);
+  // Resolved once and reused. The status decides the masking, the exception
+  // record and the response, and re-deriving it at each use is how those
+  // decisions come to disagree about the same failure.
+  const status = resolveFailure(err);
 
-  // THE EXCEPTION RECORD, FOR UNEXPECTED FAILURES ONLY.
+  // THE EXCEPTION RECORD, FOR THE 5xx CLASS ONLY, GATED ON THE RESOLVED STATUS
+  // RATHER THAN ON WHERE THE FAILURE CAME FROM. Every request already produces
+  // exactly one access record from `requestContext` at position 1, at a level
+  // derived from the status -- `warn` for a 4xx -- so a 404 or a rejected body
+  // is ordinary traffic that is already recorded, and repeating it here at
+  // `error` would bury real faults in routine client mistakes. A 5xx is
+  // different for a concrete reason: in production its message is masked out
+  // of the response below, so without this record the only account of what
+  // actually failed would be discarded at the moment it mattered. That is as
+  // true of a deliberate `HttpError(503)` as of an unrecognised throw, and a
+  // gate that asked which of the two it was would lose exactly the deliberate
+  // one.
   //
-  // WHY NOT EVERY FAILURE. Every request already produces exactly one access
-  // record from `requestContext` at position 1, emitted on response completion
-  // at a level derived from the status -- `warn` for a 4xx, `error` for a 5xx.
-  // A 404 or a rejected body is therefore already recorded, and it is ordinary
-  // traffic rather than an incident: duplicating it here at `error` would fill
-  // the error stream with routine client mistakes and make it useless for
-  // spotting a real fault. An unexpected failure is genuinely different, and
-  // for a concrete reason -- its message has just been masked out of the
-  // response, so without this record the only account of what actually failed
-  // would be discarded at the moment it mattered.
-  //
-  // WHY THE GATE IS THE ORIGIN AND NOT THE STATUS CLASS. Gating on `status >=
-  // 500` catches every unexpected failure, and one thing besides: a deliberate
-  // `HttpError` in the 5xx class, which is a handled outcome and would then be
-  // reported twice -- once as ordinary traffic by the access record and once as
-  // an incident here. That is the whole distinction the two-record taxonomy
-  // rests on, so the gate is `unexpected`, which is true for exactly the
-  // fallback branch of `resolveFailure`: an unrecognised failure, or a typed
-  // one whose declared status could not be sent.
-  //
-  // THE CONSEQUENCE, STATED SO IT IS NOT DISCOVERED. A route that deliberately
-  // raises a 5xx `HttpError` gets no exception record, and in production its
-  // message is masked out of the response -- so a route needing that message
-  // preserved must log it at the raise site, where the failure's context is
-  // still in hand. No route in this service raises a 5xx today; every one of
-  // them is a 404 or a 400.
-  //
-  // WHY `requestId` IS SET EXPLICITLY. It has to be the same value the access
+  // `requestId` is set explicitly because it must be the same value the access
   // record carries, so the two lines describing one failed request can be
-  // joined. The access record gets it through pino-http's serialized `req.id`,
-  // which says nothing about the bindings of this logger; relying on those
-  // bindings to supply it implicitly would leave the field absent here and the
-  // correlation impossible. The shared root instance is used rather than
-  // `req.log` for the same predictability: one record shape, whatever state the
-  // request object is in by the time a failure arrives.
-  //
-  // WHY PASSING THE RAW ERROR UNDER `err` IS SAFE, WHICH IT WOULD NOT BE BY
-  // DEFAULT. pino's own `err` serializer emits the type, message and stack --
-  // and then copies every other enumerable property of the error into the
-  // record, which is how a nested `headers`, `config` or body-parser `body`
-  // reaches a log line with a credential or a payload inside it. This delegated
-  // error is arbitrary: it comes from a route, a library or a parser. What
-  // makes this call site safe is that src/lib/logger.js replaces that default
-  // with an allowlist emitting only type, message, stack and a code or status
-  // -- so the reduction happens once, at the root, for this record and every
-  // other. Nothing else about the request is logged here: no headers, no body.
-  if (unexpected) {
+  // joined. This logger's bindings do not supply it -- the access record gets
+  // it through pino-http's serialized `req.id` -- so leaving it implicit would
+  // leave the field absent here and the correlation impossible.
+  if (status >= SERVER_ERROR_MIN_STATUS) {
     logger.error(
       {
         err,
         requestId: req.id,
         method: req.method,
-        // `originalUrl`, not `url`: Express rewrites `req.url` relative to the
-        // mount point of a router mounted under a prefix, so `url` can name a
-        // path the client never sent -- useless for correlating a failure with
-        // the access record, which reports the URL as it arrived.
-        path: req.originalUrl,
+        // THE PATHNAME ONLY, AND NEVER THE QUERY STRING. `req.originalUrl`
+        // carries the query as the client sent it, and a query string is
+        // caller-controlled: `?access_token=...`, a reset token, a signed
+        // URL's signature. A log stream is copied, shipped and retained far
+        // more freely than the request it describes, so a credential written
+        // here outlives its own usefulness -- and no list of parameter names
+        // could make keeping it safe, because the names are the caller's to
+        // choose. The access record's request serializer in
+        // src/middleware/request-context.js drops it for the same reason, and
+        // these two records must describe one request the same way.
+        //
+        // `req.path` is Express's pathname of the ORIGINAL url, not the
+        // mount-relative one: verified on Express 5.2.1 that a failure raised
+        // inside a router mounted at `/api/v1` reaches this handler with
+        // `req.url` already restored, so `req.path` is the full path the
+        // client sent. It is bounded and type-guarded because this handler is
+        // the pipeline's single exit and must not itself throw.
+        path:
+          typeof req.path === 'string'
+            ? req.path.slice(0, MAX_LOGGED_PATH_LENGTH)
+            : '',
         status
       },
-      'Request failed with an unhandled server error'
+      'Request failed with a server error'
     );
   }
 
@@ -467,6 +403,11 @@ function errorHandler(err, req, res, next) {
   // HTTP contract fixes this shape at three fields, and a field that appears
   // only sometimes is one every consumer has to branch on.
   //
+  // This is also the only failure body the service builds. The flat
+  // `503 { status: "shutting_down" }` that `GET /health/ready` answers while
+  // the process drains is a probe shape owned by src/routes/health.routes.js,
+  // not an envelope produced here.
+  //
   // `requestId` comes from `req.id`, established by `requestContext` at
   // position 1. That is precisely why that middleware runs first: `req.id` is
   // guaranteed present here even for a request that never reached a route or
@@ -485,10 +426,4 @@ function errorHandler(err, req, res, next) {
   });
 }
 
-// Assigned directly rather than wrapped. src/app.js pulls this module in as
-// `errorHandler` and hands it straight to `app.use(errorHandler)`, so
-// exporting `{ errorHandler }` would register an object -- and an object has no
-// `length`, so the arity test above would fail and the whole error path would
-// go quiet. A factory would be no better: there is nothing to configure here,
-// since `isProduction` is read from the frozen configuration at call time.
 module.exports = errorHandler;

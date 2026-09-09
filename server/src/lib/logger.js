@@ -2,75 +2,50 @@
 /**
  * The one pino root logger for this service.
  *
- * SINGLE RESPONSIBILITY. This module constructs exactly one pino logger for
- * the process and exports that instance. It owns five things and nothing
- * else: the shared identity fields stamped on every record (`base`), the
- * redaction policy applied before any record is written (`redact`), the
- * allowlist that decides which fields of a logged error may be written at all
- * (`serializers.err` plus the `formatters.log` hook that keeps it in force on
- * derived loggers), the environment-aware rendering decision, and the
- * destination those records are written to -- which is also what decides
- * whether the process layer's flush can guarantee anything. It writes no
- * records of its own -- the modules listed below do that -- and it holds no
- * request state, no counters and no files.
+ * SINGLE RESPONSIBILITY: construct exactly one pino logger for the process and
+ * export that instance. It owns the shape of a record -- the `base` identity
+ * fields, the `redact` policy, the error allowlist with its length bound and
+ * credential scrub, the rendering decision, and the destination together with
+ * what happens when that destination fails. It holds no request state, no
+ * counters and no files, and writes no record of its own except a diagnostic
+ * about its own sink.
  *
- * WHO CONSUMES THIS INSTANCE, and what each of them needs from it:
- *
- *   * src/middleware/request-context.js -- hands this instance to pino-http,
- *     which derives the per-request child logger on `req.log` and emits the
- *     one access record per request. That child inherits `level`, `base` and
- *     `redact` from here, which is why the redaction policy belongs on the
- *     root rather than being re-stated per request.
- *   * src/middleware/error-handler.js -- writes the exception record for the
- *     500 class, where the real message is masked out of the response and
- *     would otherwise be lost entirely.
+ * ITS THREE CONSUMERS, and what each needs from it:
+ *   * src/middleware/request-context.js -- passes this instance to pino-http
+ *     for the per-request `req.log` child and the one access record per
+ *     request. That child inherits `level`, `base`, `redact` and the hook from
+ *     here; the `req`/`res` serializers are the one part it must own itself,
+ *     because pino-http shadows those two keys (see the `serializers` key).
+ *   * src/middleware/error-handler.js -- writes the exception record for a
+ *     server-side failure, whose response message is masked in production, so
+ *     the record is the only place the real one survives. Which failures reach
+ *     it is that module's gate to state, not this one's.
  *   * src/server.js -- the start-up, listener-error and shutdown records, and
- *     the flush step of the log -> flush -> release the PM2 IPC channel ->
- *     exit sequence that every exit path in this service must follow. That
- *     module awaits the flush callback before it disconnects and exits, which
- *     only means something because of the destination this file installs.
+ *     the flush step of its log -> flush -> release the PM2 IPC channel -> exit
+ *     sequence, which means something only because of the destination
+ *     installed here.
  *
- * WHY PINO RATHER THAN WINSTON. pino emits newline-delimited JSON by default
- * -- `level`, `time`, `pid`, `hostname`, `msg` -- supports child loggers and
- * built-in redaction, and carries materially lower overhead, whereas
- * winston's JSON output requires explicit format configuration. Its
- * human-readable half, pino-pretty, is a development tool that must not run
- * in production, because it re-adds precisely the overhead pino exists to
- * avoid; the branch further down is where that is enforced.
- *
- * WHY THERE IS ONE INSTANCE AND NO FACTORY. A second root logger would mean
- * two identity blocks, two redaction policies and two transport decisions
- * that can drift apart, with nothing to report the divergence. Per-request
- * loggers are still created -- pino-http derives them as children of this one
- * -- so a caller wanting request-scoped fields uses `req.log`, never a second
- * root.
- *
- * WHY THE CONFIGURATION IMPORT IS NOT GUARDED HERE. src/config/index.js
- * validates during module evaluation and throws ONE aggregated error naming
- * every invalid variable at once. src/server.js performs the first internal
- * import of that module inside a try/catch and renders whatever it throws as
- * a single JSON object on stderr through its logger-free fatal() fallback --
- * which exists precisely because a configuration failure happens before any
- * logger does. Catching that error here would swallow the aggregated message
- * and leave an operator with less to act on, and there would be nothing to
- * report it with in any case: this file is the logger.
+ * ONE INSTANCE, NO FACTORY: two root loggers would mean two identity blocks,
+ * two redaction policies and two transport decisions able to drift apart with
+ * nothing reporting the divergence. The configuration import is deliberately
+ * unguarded -- a configuration failure has to surface through src/server.js's
+ * logger-free stderr fallback, because this file IS the logger.
  *
  * @module lib/logger
  */
 
 'use strict';
 
-/*
- * The logging library itself, and one of only two imports in this file. pino
- * is a declared runtime dependency, so it is present on a production tree.
- * Its human-readable companion package is deliberately NOT imported at the top
- * of this file: it ships as a development dependency and is absent from a
- * production install, so a top-level import of it would crash the process at
- * start-up. The non-production branch further down is where that package is
- * required, inside the conditional, so the resolution never happens in
- * production.
- */
+// The logging library, a declared runtime dependency present on every tree.
 const pino = require('pino');
+
+/*
+ * `fs.writeSync()` is the only way to report that the log stream itself has
+ * failed: it needs no logger, no transport and no turn of the event loop, so it
+ * still works when the sink below does not. The `node:` prefix is used because
+ * it cannot be shadowed by a package of the same name.
+ */
+const fs = require('node:fs');
 
 /*
  * The frozen configuration object, and the only source of environment-derived
@@ -124,9 +99,13 @@ const config = require('../config');
  * `JSON.stringify` and `for...in` both ignore symbol keys, which is what pino
  * uses to build a record.
  *
+ * The description names this MODULE rather than the service. Service identity
+ * reaches a record only through `config.serviceName`, and a second copy of the
+ * name here would be one more place a rename has to remember.
+ *
  * @type {symbol}
  */
-const SANITIZED_ERROR = Symbol('hello-world-service.sanitized-error');
+const SANITIZED_ERROR = Symbol('lib/logger.sanitized-error');
 
 /**
  * How many links of an `err.cause` chain are folded into the message and the
@@ -148,12 +127,189 @@ const MAX_CAUSE_DEPTH = 5;
 const MAX_RENDERED_VALUE_LENGTH = 512;
 
 /**
- * Renders a non-error value as a bounded, single string.
+ * Longest error message kept, and the bound applied to every string argument
+ * of a log call.
+ *
+ * A message that says what failed fits comfortably inside a kilobyte; past
+ * that the string has stopped being a diagnosis and started being a payload --
+ * a rejected request body, a rendered SQL statement, a base64 attachment. The
+ * value is a module constant rather than a configured one on purpose: a bound
+ * an operator can raise is a bound an incident can raise.
+ *
+ * @type {number}
+ */
+const MAX_MESSAGE_LENGTH = 1024;
+
+/**
+ * Longest stack kept, root frames and folded cause frames together. Four
+ * kilobytes holds roughly forty frames, which is more than any diagnosis in
+ * this service needs and far less than a runaway recursion produces.
+ *
+ * @type {number}
+ */
+const MAX_STACK_LENGTH = 4096;
+
+/**
+ * Longest `err.code` kept when the code is a string. Node's system codes and
+ * body-parser's `entity.parse.failed` are tens of characters; a longer value
+ * is a library using the field for something other than a code.
+ *
+ * @type {number}
+ */
+const MAX_CODE_LENGTH = 128;
+
+/**
+ * Longest `err.type` kept. A constructor or `name` this long is not a type
+ * name, and the field must not become a second message channel.
+ *
+ * @type {number}
+ */
+const MAX_TYPE_LENGTH = 128;
+
+/**
+ * The substitute written in place of credential material found inside a
+ * string. Spelled differently from pino's own `[Redacted]` censor deliberately:
+ * a reader seeing this one knows the value was removed from INSIDE a message or
+ * a stack by this module, not from a redacted path by pino.
+ *
+ * @type {string}
+ */
+const SECRET_PLACEHOLDER = '[REDACTED]';
+
+/**
+ * Credential material inside a URL: `scheme://user:pass@host`. Matched as the
+ * whole userinfo component so both halves go, since a bare username is an
+ * identifier this service has no business logging either.
+ *
+ * The scheme is bounded to 32 characters rather than left open. An unbounded
+ * run followed by a required `://` backtracks from every position in the
+ * string, which is quadratic in its length -- measured at 12 ms on a 4 KB stack
+ * of name characters, against 0.5 ms bounded. A scrubber whose cost an
+ * attacker can raise is not much of a defence against log amplification, and
+ * no real scheme is anywhere near that long.
+ *
+ * @type {RegExp}
+ */
+const URL_USERINFO_PATTERN = /([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/?#@]+@/gi;
+
+/**
+ * An HTTP authorization credential quoted inside a message or a stack --
+ * `Bearer <token>`, `Basic <base64>`. The scheme is kept because it is
+ * diagnostic; the credential after it is not.
+ *
+ * @type {RegExp}
+ */
+const AUTH_SCHEME_PATTERN = /\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+/gi;
+
+/**
+ * A `name=value` or `name: value` pair whose NAME ends in one of the words
+ * this service treats as naming a credential -- the shape a query string, a
+ * connection string, a header dump, a JSON body fragment and a key/value log
+ * line all take.
+ *
+ * The name is matched as a run of name characters ENDING in one of the listed
+ * words, so prefixed forms (`x_api_key`, `db_password`, `user.token`) are
+ * covered rather than slipping through on their prefix. The cost is that a name
+ * merely ending in one of the words -- `monkey` -- is scrubbed too, which is
+ * the safe direction to be wrong in.
+ *
+ * QUOTES AROUND EITHER SIDE ARE OPTIONAL, AND THAT IS WHAT COVERS A BODY. A
+ * serialized JSON body reaches a log line as `{"password":"live"}` -- the name
+ * closes with a quote before the separator and the value opens with one after
+ * it -- so a pattern that only accepted a bare `name=value` left every
+ * request-body credential untouched, which is the shape a body-parser failure
+ * or a client library's error message quotes most often. The optional quote is
+ * matched as part of the separator so the value alone is replaced and the
+ * surrounding JSON stays syntactically recognisable. Single quotes and
+ * backticks are accepted too, because a message built by string interpolation
+ * uses whichever the author happened to type.
+ *
+ * The value runs to the next delimiter: `&`, `;`, `,`, whitespace, a quote of
+ * any kind, or a closing bracket, brace or parenthesis -- so a JSON value stops
+ * at its own closing quote and a query parameter at its `&`.
+ *
+ * The prefix run is bounded to 64 characters for the cost reason given above
+ * `URL_USERINFO_PATTERN` -- measured at 20 ms unbounded on a 4 KB pathological
+ * string against 1.3 ms bounded -- and the bound loses nothing: the sensitive
+ * word has to be at the END of the name, so only the tail of a longer name
+ * decides the match.
+ *
+ * @type {RegExp}
+ */
+const SENSITIVE_PAIR_PATTERN =
+  /([A-Za-z0-9_.[\]-]{0,64}(?:access_token|refresh_token|api[_-]?key|apikey|authorization|auth|credentials?|passphrase|passwd|password|pwd|secret|session[_-]?id|session|signature|sig|token|cookie|key))(["'`]?\s*[=:]\s*["'`]?)[^&;,\s'"`)\]}]+/gi;
+
+/**
+ * Removes credential material from a string before it can be written.
+ *
+ * WHY A STRING SCRUBBER EXISTS ALONGSIDE THE PATH-BASED `redact` POLICY.
+ * `redact` removes a value that sits at a named path in the record, and
+ * `sanitizeError` drops every error property that is not on its allowlist.
+ * Neither reaches a secret that is INSIDE one of the strings that IS allowed:
+ * a client library puts the full request URL in `err.message`, a connection
+ * error quotes its connection string, a stack frame carries the argument it was
+ * called with. Those are the strings this function cleans.
+ *
+ * THREE PATTERNS AND NO MORE, in this order, because over-scrubbing is its own
+ * failure: a message rewritten past recognition costs an operator the incident.
+ *   1. URL userinfo -- `https://u:p@host` becomes `https://[REDACTED]@host`.
+ *   2. `Bearer`/`Basic` credentials -- applied BEFORE the pair pattern, so
+ *      `authorization: Bearer abc` loses the token rather than losing only the
+ *      word `Bearer` and leaving the token behind it.
+ *   3. `name=value` pairs whose name names a credential.
+ * Matching is case-insensitive throughout; header names, query keys and
+ * environment-style keys all vary in case.
+ *
+ * @param {string} text The string about to be written.
+ * @returns {string} The same string with credential material replaced by
+ *   `SECRET_PLACEHOLDER`, or the input unchanged when it carries none.
+ */
+function scrubSecrets(text) {
+  return text
+    .replace(URL_USERINFO_PATTERN, `$1${SECRET_PLACEHOLDER}@`)
+    .replace(AUTH_SCHEME_PATTERN, `$1 ${SECRET_PLACEHOLDER}`)
+    .replace(SENSITIVE_PAIR_PATTERN, `$1$2${SECRET_PLACEHOLDER}`);
+}
+
+/**
+ * Bounds a string and scrubs it: the one function every string this module
+ * writes passes through.
+ *
+ * THE ORDER IS DELIBERATE -- BOUND FIRST, THEN SCRUB. Scrubbing first would
+ * run three regular expressions across a value whose size this service does not
+ * control, which is the CPU half of the same amplification the length cap
+ * exists to prevent; a hostile ten-megabyte message must cost a slice, not a
+ * scan. Cutting first is safe because a cut only ever removes a suffix: what
+ * remains of `access_token=live-secret` after a cut is still a `name=value`
+ * pair, and the scrub still removes it.
+ *
+ * @param {*} text The candidate string. A non-string -- an error whose
+ *   `message` is an object, a `stack` a library replaced with a getter
+ *   returning `undefined` -- yields the empty string, so the record's shape
+ *   never varies.
+ * @param {number} maxLength The most characters to keep, before the marker.
+ * @returns {string} The bounded, scrubbed string, carrying the explicit
+ *   `... (truncated)` marker when characters were dropped.
+ */
+function safeText(text, maxLength) {
+  if (typeof text !== 'string' || text.length === 0 || maxLength <= 0) {
+    return '';
+  }
+
+  const bounded = text.length > maxLength ? text.slice(0, maxLength) : text;
+  const scrubbed = scrubSecrets(bounded);
+
+  return bounded.length < text.length ? `${scrubbed}... (truncated)` : scrubbed;
+}
+
+/**
+ * Renders a non-error value as a bounded, scrubbed, single string.
  *
  * @param {*} value The value logged under the `err` key.
- * @returns {string} Its string form, truncated with an explicit marker when it
- *   exceeds `MAX_RENDERED_VALUE_LENGTH`, or a fixed notice when the value
- *   cannot be converted to a string at all.
+ * @returns {string} Its string form, scrubbed of credential material and
+ *   truncated with an explicit marker when it exceeds
+ *   `MAX_RENDERED_VALUE_LENGTH`, or a fixed notice when the value cannot be
+ *   converted to a string at all.
  */
 function renderValue(value) {
   let rendered;
@@ -169,9 +325,7 @@ function renderValue(value) {
     return 'value could not be converted to a string';
   }
 
-  return rendered.length > MAX_RENDERED_VALUE_LENGTH
-    ? `${rendered.slice(0, MAX_RENDERED_VALUE_LENGTH)}... (truncated)`
-    : rendered;
+  return safeText(rendered, MAX_RENDERED_VALUE_LENGTH);
 }
 
 /**
@@ -208,14 +362,31 @@ function resolveErrorType(error) {
  * properties are not, which is what keeps the allowlist true for the whole
  * chain rather than only its first link.
  *
+ * THE BUDGET IS SPENT AS THE WALK PROCEEDS, NOT CHECKED AT THE END, and that
+ * distinction is the whole point rather than a refinement. Folding five links
+ * first and cutting the result afterwards means five megabyte-scale strings are
+ * concatenated in memory -- inside a log call, on the failure path, where the
+ * process is least able to absorb it. Each link is therefore bounded by what
+ * is LEFT of the budget before it is appended, and the walk stops as soon as
+ * the budget is gone.
+ *
  * @param {object} error The error-like value being reduced.
- * @returns {{ message: string, stack: string }} The folded message and stack.
- *   Either may be empty, because a value can be error-like without carrying
- *   both; the fields are still written, so the record's shape never varies.
+ * @returns {{ message: string, stack: string }} The folded message and stack,
+ *   each scrubbed of credential material and bounded by `MAX_MESSAGE_LENGTH`
+ *   and `MAX_STACK_LENGTH` respectively, plus the truncation markers. Either
+ *   may be empty, because a value can be error-like without carrying both; the
+ *   fields are still written, so the record's shape never varies.
  */
 function foldCauseChain(error) {
-  let message = typeof error.message === 'string' ? error.message : '';
-  let stack = typeof error.stack === 'string' ? error.stack : '';
+  let message = safeText(error.message, MAX_MESSAGE_LENGTH);
+  let stack = safeText(error.stack, MAX_STACK_LENGTH);
+
+  // What is left to spend on the chain: the two caps less what the root link
+  // has already used. The separators (`': '` and `'\ncaused by: '`) are
+  // charged against the budget too, so a long chain of empty messages cannot
+  // grow the line either.
+  let messageBudget = MAX_MESSAGE_LENGTH - message.length;
+  let stackBudget = MAX_STACK_LENGTH - stack.length;
 
   // Guards against a chain that points back into itself: `err.cause = err`,
   // or two errors naming each other, would otherwise loop until the process
@@ -239,17 +410,25 @@ function foldCauseChain(error) {
       break;
     }
 
-    if (depth >= MAX_CAUSE_DEPTH) {
+    if (depth >= MAX_CAUSE_DEPTH || messageBudget <= 0 || stackBudget <= 0) {
+      // Either the chain is deeper than this service reads, or what has been
+      // folded already fills the line. Both are the same outcome for a reader
+      // -- there was more -- and both carry the same marker.
       message += ': ...';
       stack += '\ncauses have been truncated...';
       break;
     }
 
     visited.add(cause);
-    message += `: ${cause.message}`;
-    stack += `\ncaused by: ${
-      typeof cause.stack === 'string' ? cause.stack : ''
-    }`;
+
+    const linkMessage = safeText(cause.message, messageBudget);
+    message += `: ${linkMessage}`;
+    messageBudget -= linkMessage.length + 2;
+
+    const linkStack = safeText(cause.stack, stackBudget);
+    stack += `\ncaused by: ${linkStack}`;
+    stackBudget -= linkStack.length + 12;
+
     cause = cause.cause;
     depth += 1;
   }
@@ -280,6 +459,13 @@ function foldCauseChain(error) {
  * exception record (see src/middleware/error-handler.js). A route needing more
  * context in the log logs it at the raise site, where the value's shape is
  * known.
+ *
+ * AND WHAT IS ALLOWED IS STILL NOT TRUSTED. An allowlist of field NAMES says
+ * nothing about the field's contents: a library error's `message` routinely
+ * quotes the URL it was called with, and a stack frame can carry an argument.
+ * Every string on the list therefore goes through `safeText`, so each is
+ * bounded and scrubbed of credential material before it is written -- `type`,
+ * the folded `message` and `stack`, and a string `code`.
  *
  * @param {*} value Whatever was logged under `err`: an `Error`, an error-like
  *   object, or -- since `next(err)` and a rejected promise both accept any
@@ -315,14 +501,20 @@ function sanitizeError(value) {
   }
 
   try {
-    record.type = resolveErrorType(value);
+    record.type = safeText(resolveErrorType(value), MAX_TYPE_LENGTH);
 
     const folded = foldCauseChain(value);
     record.message = folded.message;
     record.stack = folded.stack;
 
+    // The field keeps its type -- a string code stays a string and a numeric
+    // one stays a number, because a consumer matching `err.code === 'EPIPE'`
+    // or `err.code === 11` must keep working. Only the string form can carry
+    // arbitrary text, so only the string form is bounded and scrubbed.
     const code = value.code;
-    if (typeof code === 'string' || typeof code === 'number') {
+    if (typeof code === 'string') {
+      record.code = safeText(code, MAX_CODE_LENGTH);
+    } else if (typeof code === 'number') {
       record.code = code;
     }
 
@@ -405,13 +597,22 @@ function sanitizeRecord(record) {
  * The options handed to pino, assembled in one place so the whole shape of a
  * log record is readable without tracing calls.
  *
- * Everything pino already defaults to sensibly is deliberately absent: the
- * `time` field, the `msg` message key, the serializers and the level's
- * numeric representation. Each absence below is a decision rather than an
- * oversight, and the ones a reader would otherwise undo carry their reasons
- * inline. The destination is the one default this file does NOT accept, and
- * it is passed to `pino()` as a second argument rather than set here -- the
- * block above it explains why.
+ * WHAT IS LEFT AT PINO'S DEFAULT, and each absence is a decision rather than an
+ * oversight: the `time` field and its epoch-millisecond format, the `msg`
+ * message key, the numeric representation of `level` (asserted numerically by
+ * this service's acceptance criteria -- see the note below this object), and
+ * the `bindings` formatter, which would otherwise disturb the `base` fields.
+ *
+ * WHAT IS CONFIGURED HERE, all of it deliberate: the level and the identity
+ * fields; the two redacted header paths; an `err` serializer that replaces
+ * pino's default with this service's allowlist; a `log` formatter that keeps
+ * that allowlist in force on a derived logger; and a `logMethod` hook that
+ * bounds and scrubs the message channel, which neither of the other two can
+ * reach. Each key carries its reasoning inline.
+ *
+ * The destination is the one default this file does NOT accept, and it is
+ * passed to `pino()` as a second argument rather than set here -- the block
+ * above it explains why.
  *
  * @type {import('pino').LoggerOptions}
  */
@@ -472,6 +673,15 @@ const options = {
    * to every record pino-http produces, with no middleware having to remember
    * to do it.
    *
+   * THE POLICY IS NOT MADE REDUNDANT BY THE REQUEST SERIALIZER, and the two
+   * halves depend on each other. `src/middleware/request-context.js` writes
+   * only an allowlist of headers, and it keeps these two on that list SO THAT
+   * this policy replaces their values: the record then says a credential was
+   * presented without carrying it. Redaction is also the only gate left for a
+   * `{ req }` payload logged directly through this instance, which no
+   * pino-http serializer sees. Remove either half and clear-text credentials
+   * become reachable again.
+   *
    * pino's default censor -- the string `[Redacted]` -- is left in place: the
    * requirement is that these values never appear, not that the substitute
    * read a particular way, and a custom censor would be one more thing to keep
@@ -488,10 +698,18 @@ const options = {
    * record in src/middleware/error-handler.js, and the fatal, drain-failure
    * and listener records in src/server.js.
    *
-   * `req` and `res` are deliberately NOT given serializers here. pino-http
-   * installs its own for those two on the child it derives, and a root
-   * serializer for them would be shadowed there while suggesting to a reader
-   * that it governs the access record.
+   * `req` and `res` are deliberately NOT given serializers here, and the
+   * reason is mechanical rather than a division of taste: pino-http installs
+   * its own for those two keys on the child it derives, so a root serializer
+   * for them would be shadowed on the access record -- the one record that
+   * actually carries a request -- while reading as though it governed it. The
+   * request and response serializers therefore live where they take effect, in
+   * `src/middleware/request-context.js`, and they are what keeps a query
+   * string, a forged `X-Forwarded-*` header and the response's own headers out
+   * of the access record while recording Express's trust-aware `req.ip` and
+   * `req.protocol` in their place. What remains this module's business for
+   * those two keys is the `redact` policy above, which applies after any
+   * serializer has run.
    */
   serializers: {
     err: sanitizeError
@@ -503,8 +721,9 @@ const options = {
    * reasoning: pino-http replaces `serializers.err` on the child it derives
    * from this instance but passes no formatters, so that child inherits this
    * hook -- and pino runs an inherited log formatter before the per-key
-   * serializers. The two keys together therefore cover every record this
-   * process writes today. The obligation that comes with it, stated in full at
+   * serializers. The two keys together therefore reduce the `err` payload of
+   * every record this process writes today; the message channel is the `hooks`
+   * key below. The obligation that comes with it, stated in full at
    * `sanitizeRecord`: a child CAN replace a log formatter by passing its own,
    * so a new child logger must pass none or reduce its own errors.
    *
@@ -513,6 +732,66 @@ const options = {
    */
   formatters: {
     log: sanitizeRecord
+  },
+
+  /*
+   * AND THE SAME POLICY ON THE MESSAGE CHANNEL, WHICH NEITHER OF THE TWO ABOVE
+   * CAN REACH. `logger.info(obj, 'message')` hands pino its message as a
+   * SEPARATE argument: it never appears in the merged object, so
+   * `formatters.log` does not see it, and it is not a serialized key, so no
+   * serializer sees it either. That channel carries real secrets in practice:
+   * the message of a failure is exactly where a library quotes back the URL,
+   * connection string or argument it was called with, and any caller may
+   * interpolate a value into a message without a thought for where the record
+   * is shipped and how long it is kept.
+   *
+   * A `logMethod` hook is the one place a log call can be intercepted before
+   * pino formats it, so this is where every STRING argument is bounded and
+   * scrubbed. Non-string arguments are passed through untouched -- the merged
+   * object is the other two keys' business, and pino's own printf-style
+   * interpolation values are handled by position.
+   *
+   * TWO OBLIGATIONS FOR ANYONE EDITING THIS HOOK. It must not reorder, drop or
+   * add arguments: pino reads argument POSITION to decide what is the merged
+   * object, what is the message and what are the interpolation values, so a
+   * hook that shifts them silently changes every record's shape. And it must
+   * return `method.apply(this, args)`; a hook that calls `method` without
+   * returning its result breaks `logger.child()`'s own return value.
+   *
+   * Verified on the pinned runtime: a hook set here is inherited by
+   * `logger.child()` and therefore by the per-request logger pino-http derives,
+   * so it covers every record this process writes.
+   */
+  hooks: {
+    /**
+     * Bounds and scrubs every string argument of a log call.
+     *
+     * @param {unknown[]} args The arguments as the caller passed them, in
+     *   order: optionally a merged object, then the message, then any
+     *   interpolation values.
+     * @param {Function} method The level method pino would have called.
+     * @returns {*} Whatever `method` returns, so the call behaves exactly as an
+     *   unhooked one.
+     * @this {import('pino').Logger}
+     */
+    logMethod(args, method) {
+      // Copy-on-write: the arguments array belongs to the caller's frame and a
+      // call carrying no strings -- `logger.error({ err })` -- must not pay for
+      // a copy it does not need.
+      let scrubbed = null;
+
+      for (let index = 0; index < args.length; index += 1) {
+        if (typeof args[index] === 'string') {
+          if (scrubbed === null) {
+            scrubbed = args.slice();
+          }
+
+          scrubbed[index] = safeText(args[index], MAX_MESSAGE_LENGTH);
+        }
+      }
+
+      return method.apply(this, scrubbed === null ? args : scrubbed);
+    }
   }
 };
 
@@ -529,18 +808,28 @@ const options = {
  */
 
 /**
- * The file descriptor every record is written to: standard output, for every
- * level.
- *
- * A literal rather than `process.stdout.fd` because the value is a POSIX
- * constant, not an environment-derived one, and because reading it off the
- * stream object would make the destination depend on whether Node happened to
- * wrap stdout as a TTY, a pipe or a file -- which is exactly the variability
- * the explicit destination below exists to remove.
+ * Standard output: the descriptor every record is written to, at every level.
  *
  * @type {number}
  */
 const STDOUT_FD = 1;
+
+/**
+ * Standard error: the descriptor a failure OF the log stream is reported on.
+ *
+ * @type {number}
+ */
+const STDERR_FD = 2;
+
+/**
+ * How many times a synchronous descriptor write is retried when the kernel
+ * reports the descriptor busy (`EAGAIN`) rather than broken. A pipe whose
+ * reader is merely behind is not a failed sink, and a diagnostic must not be
+ * abandoned for it; anything other than `EAGAIN` is not retried at all.
+ *
+ * @type {number}
+ */
+const MAX_SYNC_WRITE_ATTEMPTS = 3;
 
 /*
  * WHY THE DESTINATION IS CONSTRUCTED HERE AT ALL, RATHER THAN LEFT TO PINO'S
@@ -602,18 +891,24 @@ const stdoutIsSupervised =
  * `pino.destination()` is used rather than a bare `SonicBoom` so that sink
  * keeps pino's broken-pipe protection: if the reader of the pipe goes away,
  * writes become no-ops instead of an `EPIPE` crash on a process that is
- * otherwise healthy.
+ * otherwise healthy. Silent no-op writes are not an acceptable resting state
+ * either, which is what `writeToSink` detects and `handleSinkFailure` acts on.
  *
- * @type {import('node:stream').Writable|import('pino').DestinationStream}
+ * REASSIGNED ONCE, AT MOST: `handleSinkFailure` replaces this with a verified
+ * fallback on standard error when the chosen sink fails.
+ *
+ * @type {import('node:stream').Writable|import('pino').DestinationStream|{ write: (chunk: string) => boolean }}
  */
 let sink;
 
 /**
  * Whether a write to `sink` is durable by the time it returns.
  *
- * True for the synchronous sonic-boom, false for a supervisor's stream, whose
- * writes are queued and report completion through a callback. It is what
- * decides which of the two drain strategies below applies.
+ * True for the synchronous sonic-boom and for the descriptor-writing fallback,
+ * false for a supervisor's stream and for the standard-error stream used as its
+ * fallback, whose writes are queued and report completion through a callback.
+ * It is what decides which of the two drain strategies below applies, so it is
+ * updated with the sink whenever the fallback is installed.
  *
  * @type {boolean}
  */
@@ -646,13 +941,15 @@ const drainWaiters = [];
  * The first failure the sink has reported, retained so that a drain can report
  * it rather than answer as though the write had succeeded.
  *
- * WHY IT IS RETAINED RATHER THAN LOGGED. The thing that failed is the log
- * stream, so there is nowhere useful to write this from inside the logging
- * module: a record about a broken sink, written to that sink, is the record
- * most likely to be lost. The drain hands it to `src/server.js` instead, which
- * has a logger-free synchronous stderr writer for exactly this case. The FIRST
- * failure is kept rather than the last, because it is the one that explains the
- * others.
+ * WHY IT IS RETAINED AS WELL AS REPORTED. `handleSinkFailure` reports the
+ * failure immediately, on file descriptor 2, because that is the one stream
+ * that needs no logger -- writing a record about a broken sink TO that sink is
+ * the record most likely to be lost. What the retention adds is the report at
+ * the end: the drain hands this to `src/server.js`, which turns it into the
+ * `ERR_TERMINAL_FLUSH` note on its way out, so an exit never claims the final
+ * records were written when they were not. It survives a successful recovery
+ * deliberately -- a record WAS lost -- and the FIRST failure is kept rather
+ * than the last, because it is the one that explains the others.
  *
  * @type {Error|undefined}
  */
@@ -673,17 +970,426 @@ function retainSinkFailure(error) {
   sinkFailure = error instanceof Error ? error : new Error(String(error));
 }
 
-/*
- * A LISTENER ON THE SINK'S `error` EVENT, WHICH DOES TWO JOBS AT ONCE.
+/**
+ * Whether the sink has already been switched to the fallback by
+ * `handleSinkFailure`.
  *
- * It records a failure that arrives on the event channel rather than on a write
- * callback -- a full or revoked file descriptor, for instance -- so the drain
- * can report it. And it keeps that event from being unhandled: pino's own
- * broken-pipe filter swallows `EPIPE` but RE-EMITS anything else, and an
- * `error` event with no listener is thrown, which would kill a process whose
- * only real problem was that it could not write a log line.
+ * It is what makes the switch happen at most once: a failure OF the fallback
+ * must report itself, not start another switch, and a chain of switches would
+ * hide the original failure behind the last one.
+ *
+ * @type {boolean}
  */
-sink.on('error', retainSinkFailure);
+let sinkDegraded = false;
+
+/**
+ * Which destination the write accounting belongs to. Incremented when the sink
+ * is switched, so a completion callback from the sink that has been abandoned
+ * can be told apart from one belonging to the sink now in use.
+ *
+ * Without it, a stale callback would decrement `pendingWrites` a second time,
+ * the count would never return to zero, and every later drain -- including the
+ * one `src/server.js` waits on to exit -- would hang.
+ *
+ * @type {number}
+ */
+let sinkGeneration = 0;
+
+/**
+ * The rendering pipeline pino writes into instead of the façade below, when
+ * there is one: the pino-pretty stream built on the non-production branch, and
+ * `null` in production.
+ *
+ * It is tracked because it holds the sink INSTANCE rather than resolving it per
+ * write, which is what makes a fallback unreachable through it -- see
+ * `failClosedIfRenderPipelineIsDead`.
+ *
+ * @type {import('node:stream').Transform|null}
+ */
+let renderPipeline = null;
+
+/**
+ * Hands every waiting drain callback the current state of the sink and clears
+ * the queue.
+ *
+ * @returns {void}
+ */
+function releaseDrainWaiters() {
+  while (drainWaiters.length > 0) {
+    drainWaiters.shift()(sinkFailure);
+  }
+}
+
+/**
+ * Writes one string straight to a descriptor, with no stream, no buffer and no
+ * event loop in between.
+ *
+ * @param {number} fd The descriptor to write to.
+ * @param {string} chunk The string to write, newline included.
+ * @returns {boolean} `true` when the bytes were accepted by the descriptor,
+ *   `false` when the write failed -- including after `MAX_SYNC_WRITE_ATTEMPTS`
+ *   `EAGAIN` reports, which is a descriptor too busy to be relied on here.
+ */
+function writeToDescriptor(fd, chunk) {
+  for (let attempt = 0; attempt < MAX_SYNC_WRITE_ATTEMPTS; attempt += 1) {
+    try {
+      fs.writeSync(fd, chunk);
+      return true;
+    } catch (error) {
+      // `EAGAIN` says the descriptor is a non-blocking pipe whose reader is
+      // behind -- the sink is not broken, the write simply did not fit, so it
+      // is worth immediately retrying a bounded number of times. Anything else
+      // is a real failure of this descriptor and retrying it would only delay
+      // the report.
+      if (error === null || typeof error !== 'object' || error.code !== 'EAGAIN') {
+        return false;
+      }
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Renders the one-line JSON diagnostic that reports a failure of the log
+ * stream itself.
+ *
+ * It carries the same three identity fields as every other record from this
+ * process -- so it can be correlated with them -- plus a machine-readable code
+ * and the failure's own message, bounded and scrubbed like any other string
+ * this module writes. `JSON.stringify` escapes every newline, so the result is
+ * exactly one line for the same line-at-a-time tooling that reads the service's
+ * ordinary output.
+ *
+ * @param {string} code The machine-readable code: `ERR_LOG_SINK_FAILURE` for
+ *   the first failure, `ERR_LOG_FALLBACK_FAILURE` for a failure of the
+ *   fallback, `ERR_LOG_SINK_UNAVAILABLE` when no sink is left at all, and
+ *   `ERR_LOG_SINK_UNREACHABLE` when a sink exists but pino can no longer reach
+ *   it.
+ * @param {string} message The short human-readable account.
+ * @param {Error} failure The failure being reported.
+ * @returns {string} One line of JSON, newline included.
+ */
+function buildSinkDiagnostic(code, message, failure) {
+  return `${JSON.stringify({
+    level: 'fatal',
+    time: Date.now(),
+    pid: process.pid,
+    instance: config.instance,
+    service: config.serviceName,
+    code,
+    msg: message,
+    err: safeText(failure.message, MAX_MESSAGE_LENGTH)
+  })}\n`;
+}
+
+/**
+ * The synchronous fallback destination: standard error, written straight to the
+ * descriptor.
+ *
+ * Used when nothing outside this process owns standard output, in which case a
+ * descriptor write is the strongest thing available -- durable by the time it
+ * returns, exactly like the sonic-boom it replaces, so the flush barrier keeps
+ * meaning what it meant.
+ *
+ * @type {{ write: (chunk: string) => boolean }}
+ */
+const synchronousStderrSink = {
+  write(chunk) {
+    if (writeToDescriptor(STDERR_FD, chunk)) {
+      return true;
+    }
+
+    // The fallback has failed too, which ends the process: the handler knows
+    // the sink is already degraded, and its answer to a failed fallback is to
+    // fail closed rather than keep serving with nothing recording it. The
+    // `return` below is unreachable in practice and kept so this method's
+    // contract stays a boolean-returning `write`.
+    handleSinkFailure(new Error(
+      `the fallback log sink could not write to file descriptor ${STDERR_FD}`
+    ));
+
+    return false;
+  }
+};
+
+/**
+ * Ends the process because it can no longer produce an audit trail.
+ *
+ * WHY EXITING IS THE CORRECT LAST RESORT, AND WHY IT IS ONLY THE LAST RESORT.
+ * A service that keeps answering requests with no access and no exception
+ * records is serving blind: nothing is left to establish what it did, who
+ * asked, or that it failed -- which is the state the fallback above exists to
+ * avoid, and the state this function is for when the fallback cannot be
+ * established either. Exiting non-zero hands the decision to the supervisor:
+ * PM2's `autorestart` replaces the worker with one that has a working sink,
+ * which is a bounded, visible outage instead of an unbounded invisible one. The
+ * IPC channel is released first for the reason `src/server.js` documents at
+ * length: a PM2 worker that dies with the channel attached is reported as a
+ * crash and can be `SIGKILL`ed at `kill_timeout` rather than exiting cleanly.
+ *
+ * @param {string} code The machine-readable code for the reason no sink is
+ *   left: `ERR_LOG_SINK_UNAVAILABLE` when no fallback could be verified,
+ *   `ERR_LOG_FALLBACK_FAILURE` when the fallback in use has itself failed, and
+ *   `ERR_LOG_SINK_UNREACHABLE` when a verified fallback exists but pino can no
+ *   longer reach it.
+ * @param {string} message The short human-readable account of that reason.
+ * @param {Error} failure The failure that left the process with no sink.
+ * @returns {never} Never returns -- the process is gone.
+ */
+function failClosed(code, message, failure) {
+  // Best-effort, and deliberately not conditional on success: there may be no
+  // descriptor left to report on, and the exit must happen either way.
+  writeToDescriptor(STDERR_FD, buildSinkDiagnostic(code, message, failure));
+
+  try {
+    process.disconnect?.();
+  } catch (disconnectFailure) {
+    // A channel that is already gone is the outcome this call wanted. It is
+    // retained rather than ignored so that, if the exit below is ever made
+    // conditional, the reason is still on record.
+    retainSinkFailure(disconnectFailure);
+  }
+
+  process.exit(1);
+}
+
+/**
+ * Whether a stream can be trusted to carry the log records from here on, tested
+ * by writing the diagnostic through it rather than by inspecting it.
+ *
+ * VERIFICATION HAS TWO HALVES, AND ONLY ONE OF THEM CAN BE ANSWERED HERE. The
+ * synchronous half is this function: the stream reports itself writable, is not
+ * destroyed, and accepts the line without throwing. The asynchronous half is
+ * the write's own completion callback, and it is the half that matters under a
+ * supervisor -- PM2 replaces `process.stderr.write` with a wrapper that accepts
+ * the line, forwards it to the file its descriptor names, and reports a failure
+ * of THAT write only through the callback, leaving the wrapper object's
+ * `writable` and `destroyed` flags untouched. A fallback declared verified on
+ * those flags alone is a fallback that can be discarding every line while
+ * looking healthy. So the callback is passed here and routed back into
+ * `handleSinkFailure`, which by then knows the sink is degraded and fails
+ * closed rather than trusting the flags a second time.
+ *
+ * The line written to verify is the diagnostic itself, so verification costs
+ * nothing extra and leaves the report on the stream an operator will actually
+ * read -- under a supervisor that is `error_file`, where the descriptor write
+ * does not arrive. Where the descriptor and the stream happen to be the same
+ * destination the line appears twice, which is a great deal better than a
+ * fallback that was assumed rather than tested.
+ *
+ * @param {import('node:stream').Writable} stream The candidate fallback.
+ * @param {string} diagnostic The line to verify it with.
+ * @returns {boolean} `true` when the stream is writable and accepted the line
+ *   synchronously. A later failure reported through the callback is not a
+ *   return value: it ends the process.
+ */
+function verifyStreamFallback(stream, diagnostic) {
+  if (
+    stream === null ||
+    typeof stream !== 'object' ||
+    typeof stream.write !== 'function' ||
+    stream.writable !== true ||
+    stream.destroyed === true
+  ) {
+    return false;
+  }
+
+  try {
+    // The three-argument form for the reason `writeToSink` documents: PM2's
+    // replacement takes `(string, encoding, callback)` and forwards only its
+    // third argument to the file write, so a callback passed second would never
+    // be called and this verification would have no asynchronous half at all.
+    stream.write(diagnostic, undefined, (error) => {
+      if (error) {
+        handleSinkFailure(error);
+      }
+    });
+
+    return true;
+  } catch {
+    // A stream that throws on a write is not a fallback. The binding is omitted
+    // because the caller's next step does not depend on which error it was:
+    // there is one candidate, and it has just disqualified itself.
+    return false;
+  }
+}
+
+/**
+ * Ends the process when the switch to the fallback cannot reach pino, because
+ * a rendering pipeline stands between them and has died with the sink.
+ *
+ * WHY THE SWITCH IS NOT ALWAYS ENOUGH. The façade this module hands pino
+ * resolves the sink on every write, so switching the variable is all that is
+ * needed wherever pino writes through that façade -- every production run. On
+ * the non-production branch pino writes into the pino-pretty pipeline instead,
+ * and that pipeline was given the sink INSTANCE. Measured on the pinned
+ * runtime: when the sink fails, the pipeline is destroyed with it
+ * (`destroyed === true`, `writable === false`) and records written afterwards
+ * reach no sink at all -- redirecting the failed instance does not help,
+ * because nothing is left to write to it. That is the fail-open state this
+ * whole mechanism exists to prevent, so the process fails closed instead: the
+ * diagnostic is already on the descriptor, and exiting makes the loss visible
+ * rather than silent.
+ *
+ * The check is deferred by one turn of the event loop because the teardown is
+ * not synchronous with the `error` event that reports the failure -- measured:
+ * the pipeline is still marked writable at the instant the listener runs.
+ *
+ * @param {Error} failure The failure that broke the sink.
+ * @returns {void}
+ */
+function failClosedIfRenderPipelineIsDead(failure) {
+  if (renderPipeline === null) {
+    return;
+  }
+
+  setImmediate(() => {
+    if (renderPipeline.destroyed === true || renderPipeline.writable === false) {
+      failClosed(
+        'ERR_LOG_SINK_UNREACHABLE',
+        'The rendering pipeline died with the log sink, so records can no ' +
+          'longer reach any sink; exiting rather than serving with no records',
+        failure
+      );
+    }
+  });
+}
+
+/**
+ * Handles a failure of the log stream: report it, keep serving from a verified
+ * fallback, and end the process only if there is no fallback to be had.
+ *
+ * WHY A FAILED SINK IS NOT SOMETHING TO NOTE AND CARRY ON WITH. `ENOSPC`, a
+ * revoked descriptor or a reader that went away leaves this process answering
+ * requests with no access records and no exception records -- an audit trail
+ * that stops without anything saying so, which is worse than an outage because
+ * nothing reports it. Retention alone is not enough for the same reason: it
+ * reports the loss only once the process is already exiting, possibly hours
+ * later, and says nothing to the operator in between.
+ *
+ * SO THE FAILURE IS ACTED ON IMMEDIATELY, IN THIS ORDER:
+ *   1. One minimal JSON diagnostic straight to file descriptor 2 -- no logger,
+ *      no transport, no event loop, because the thing that failed is the one
+ *      that would otherwise carry the report.
+ *   2. A switch to a fallback that has been VERIFIED by that write: standard
+ *      error's STREAM under a supervisor, which collects it into the
+ *      descriptor's `error_file`, and the descriptor directly otherwise. Under
+ *      a supervisor a raw descriptor write is owned by the daemon and vanishes,
+ *      which is why the two cases do not share one answer.
+ *   3. Failing closed -- `failClosed()` above -- only when no fallback can be
+ *      verified.
+ *
+ * THE RETAINED FAILURE IS DELIBERATELY NOT CLEARED BY A SUCCESSFUL RECOVERY,
+ * and this is worth stating plainly so nobody "fixes" it: at least one record
+ * WAS lost, so `drainSink` must still hand the failure to `src/server.js`,
+ * which writes its `ERR_TERMINAL_FLUSH` note at exit. A recovered sink means
+ * the service kept its audit trail from that point on, not that the gap never
+ * happened.
+ *
+ * @param {unknown} error The failure, from the sink's `error` event, from a
+ *   write callback, or synthesised by `writeToSink` when it detects a sink that
+ *   has been silently neutralised.
+ * @returns {void}
+ */
+function handleSinkFailure(error) {
+  retainSinkFailure(error);
+
+  const failure = error instanceof Error ? error : new Error(String(error));
+
+  if (sinkDegraded) {
+    // ALREADY ON THE FALLBACK, AND THE FALLBACK HAS NOW FAILED: THE PROCESS
+    // ENDS, UNCONDITIONALLY. There is nothing left to switch to -- the switch
+    // happens at most once by design -- and there is nothing left to consult
+    // either. A wrapper's `writable`/`destroyed` flags are exactly what cannot
+    // be trusted at this point: PM2's replacement for a standard stream reports
+    // a failure of the file write it performs through the callback alone and
+    // leaves those flags reading healthy, so a process that kept serving on
+    // them would be discarding every record while its own state said the sink
+    // was fine. That is the fail-open outcome this whole mechanism exists to
+    // prevent, and the second failure is the last evidence anyone gets of it.
+    failClosed(
+      'ERR_LOG_FALLBACK_FAILURE',
+      'The fallback log sink failed as well, so nothing is left to record ' +
+        'what this worker serves; exiting so the supervisor can replace it',
+      failure
+    );
+
+    return;
+  }
+
+  sinkDegraded = true;
+
+  const diagnostic = buildSinkDiagnostic(
+    'ERR_LOG_SINK_FAILURE',
+    'The log sink failed and at least one record was lost; switching to ' +
+      'standard error',
+    failure
+  );
+  const reportedToDescriptor = writeToDescriptor(STDERR_FD, diagnostic);
+
+  if (stdoutIsSupervised) {
+    if (!verifyStreamFallback(process.stderr, diagnostic)) {
+      failClosed(
+        'ERR_LOG_SINK_UNAVAILABLE',
+        'The log sink failed and the standard error stream could not be ' +
+          'verified as a fallback; exiting so the supervisor can replace a ' +
+          'worker that cannot record what it serves',
+        failure
+      );
+      return;
+    }
+
+    sink = process.stderr;
+    sinkIsSynchronous = false;
+
+    // The fallback needs the same protection the original sink had: an `error`
+    // event with no listener is thrown, and this handler is what turns it into
+    // a report instead of a crash.
+    sink.on('error', handleSinkFailure);
+  } else if (reportedToDescriptor) {
+    sink = synchronousStderrSink;
+    sinkIsSynchronous = true;
+  } else {
+    // Standard error is as broken as standard output -- which is what happens
+    // when both were the same pipe, and is exactly why the fallback is verified
+    // by a real write rather than assumed.
+    failClosed(
+      'ERR_LOG_SINK_UNAVAILABLE',
+      'Both standard output and standard error are unavailable; exiting so ' +
+        'the supervisor can replace a worker that cannot record what it serves',
+      failure
+    );
+    return;
+  }
+
+  // The abandoned sink's completion callbacks will never arrive, so the
+  // accounting that was waiting for them is settled here. Anything already
+  // waiting on a drain is answered now -- with the retained failure, because
+  // that is what happened -- rather than waiting for a callback from a sink
+  // nothing writes to any more.
+  sinkGeneration += 1;
+  pendingWrites = 0;
+  releaseDrainWaiters();
+
+  failClosedIfRenderPipelineIsDead(failure);
+}
+
+/*
+ * THE SINK'S `error` EVENT, WHICH IS ONE OF THE TWO CHANNELS A FAILURE ARRIVES
+ * ON -- the other being a write callback. Both go to the same handler, so a
+ * full or revoked descriptor is acted on the same way whichever channel reports
+ * it.
+ *
+ * Subscribing also keeps the event from being unhandled: an `error` event with
+ * no listener is thrown, which would kill a process whose only real problem was
+ * that it could not write a log line. Pino's own broken-pipe filter is
+ * registered first on this same event -- it neutralises the sink on `EPIPE` and
+ * re-emits anything else -- and both listeners run on the original emit, so
+ * this handler sees an `EPIPE` once and any other failure TWICE, on the emit
+ * and on the re-emit. That is one of the reasons the handler is idempotent.
+ */
+sink.on('error', handleSinkFailure);
 
 /**
  * Writes one serialized record to the sink, keeping count of what is still in
@@ -696,17 +1402,54 @@ sink.on('error', retainSinkFailure);
  * leave this module waiting for a completion report that was never going to
  * arrive.
  *
+ * IT ALSO DETECTS A SINK THAT HAS BEEN SILENTLY NEUTRALISED, which is the one
+ * failure mode that reaches neither the `error` event nor a write callback.
+ * When the reader of a pipe goes away, pino's broken-pipe filter replaces the
+ * sonic-boom's `write` with a no-op -- returning `undefined` instead of a
+ * backpressure boolean -- and every subsequent record disappears with nothing
+ * reporting it. Measured on the pinned runtime: the write that triggers
+ * `EPIPE` still returns `true`, and the next one returns `undefined`. So on the
+ * synchronous branch a non-boolean result IS the failure report, and it is
+ * routed to the same handler as the other two channels. The test is applied on
+ * that branch only: a supervisor's `process.stdout.write` replacement
+ * legitimately returns `undefined`, and treating that as a failure would
+ * degrade a perfectly healthy production sink on its first record.
+ *
  * @param {string} chunk The serialized record, newline included, exactly as
  *                       pino produced it.
- * @returns {boolean} Whatever the sink reports about backpressure. Pino does
- *                    not act on it; it is returned rather than swallowed so
- *                    this function is an honest stand-in for the sink's own
- *                    `write`.
+ * @returns {boolean|undefined} What the sink reported about backpressure, and
+ *                    the two branches differ. The synchronous branch always
+ *                    answers with a boolean -- sonic-boom's own, or `false`
+ *                    when the write was found to have gone nowhere. The
+ *                    supervised branch returns whatever the stream returned,
+ *                    which is `undefined` for PM2's `process.stdout.write`
+ *                    replacement. Pino acts on neither; the value is passed
+ *                    through rather than swallowed so this function is an
+ *                    honest stand-in for the sink's own `write`.
  */
 function writeToSink(chunk) {
   if (sinkIsSynchronous) {
-    return sink.write(chunk);
+    const generation = sinkGeneration;
+    const accepted = sink.write(chunk);
+
+    if (typeof accepted === 'boolean') {
+      return accepted;
+    }
+
+    handleSinkFailure(new Error(
+      'the log sink stopped reporting backpressure, which is how a ' +
+        'broken-pipe filter neutralises a sink whose reader has gone away; ' +
+        'records written to it are being discarded'
+    ));
+
+    // Re-issue the record through whatever the handler switched to, so the
+    // record that exposed the failure is not the one record lost to it. Bounded
+    // by construction: the switch happens at most once, so `sinkGeneration` can
+    // differ at most once and this recurses at most one level deep.
+    return sinkGeneration !== generation ? writeToSink(chunk) : false;
   }
+
+  const generation = sinkGeneration;
 
   pendingWrites += 1;
 
@@ -717,15 +1460,21 @@ function writeToSink(chunk) {
     // otherwise satisfy the drain below and let the process exit reporting a
     // clean flush.
     if (error) {
-      retainSinkFailure(error);
+      handleSinkFailure(error);
+    }
+
+    // A callback from a sink that has since been abandoned must not touch the
+    // accounting: `handleSinkFailure` settled that generation's writes when it
+    // switched, and decrementing again would put the count below zero, where it
+    // would never return to zero and every later drain would hang.
+    if (generation !== sinkGeneration) {
+      return;
     }
 
     pendingWrites -= 1;
 
     if (pendingWrites === 0) {
-      while (drainWaiters.length > 0) {
-        drainWaiters.shift()(sinkFailure);
-      }
+      releaseDrainWaiters();
     }
   });
 }
@@ -734,12 +1483,14 @@ function writeToSink(chunk) {
  * The drain `logger.flush(callback)` resolves to: reports when every record
  * written so far has reached the sink.
  *
- * On the synchronous sink there is by definition nothing outstanding, so the
- * callback runs at once. On a supervisor's stream the callback is held until
- * the last write in flight has reported completion -- which, for PM2, is the
- * point at which the line is in `logs/out.log`, because its hook forwards this
- * very callback to the file write. Either way the answer is derived from the
- * sink's own behaviour rather than from a delay chosen by guesswork.
+ * On a synchronous sink -- the sonic-boom, or the descriptor-writing fallback --
+ * there is by definition nothing outstanding, so the callback runs at once. On
+ * a stream sink the callback is held until the last write in flight has
+ * reported completion; PM2's `process.stdout.write` replacement forwards this
+ * very callback to the write it performs for `out_file`, so what is being
+ * awaited is that write's own completion report. Either way the answer is
+ * derived from the sink's own behaviour rather than from a delay chosen by
+ * guesswork.
  *
  * IT REPORTS FAILURE AS WELL AS COMPLETION, which is the difference between a
  * barrier and a formality. If any write has failed, or the sink has emitted an
@@ -784,53 +1535,38 @@ function drainSink(callback) {
  * Reassigned on the non-production branch below, where pino-pretty becomes the
  * destination and renders into the same sink.
  *
- * @type {{ write: (chunk: string) => boolean, flush: (callback?: () => void) => void }}
+ * THE FLUSH CALLBACK REPORTS FAILURE, AND ITS ARGUMENT IS PART OF THE CONTRACT
+ * rather than an implementation detail: `drainSink` hands it the first failure
+ * the sink reported, or nothing at all when every write completed.
+ * `src/server.js` types its own `finish(flushFailure)` on exactly that and
+ * writes an `ERR_TERMINAL_FLUSH` record to stderr when the argument is present,
+ * so a callback typed as taking no arguments would make the process exit as
+ * though the final records had been written. The argument survives a recovered
+ * sink failure too -- a record was lost, and that is what the note says.
+ *
+ * @type {{
+ *   write: (chunk: string) => boolean|undefined,
+ *   flush: (callback?: (error?: Error) => void) => void
+ * }}
  */
 let target = { write: writeToSink, flush: drainSink };
 
 /*
- * PINO-PRETTY IS BUILT ONLY ON THE NON-PRODUCTION BRANCH, AND THIS
- * CONDITIONAL MUST NOT BE FLATTENED.
+ * PINO-PRETTY IS BUILT ONLY ON THE NON-PRODUCTION BRANCH, AND THE `require`
+ * MUST STAY INSIDE IT. pino-pretty is a devDependency and a production host
+ * installs with `npm ci --omit=dev`, so the package is not on disk there; an
+ * unconditional reference -- a top-level import, or a transport target named in
+ * the options object -- is resolved while the logger is being constructed and
+ * kills a production start-up before the listener binds, even though its value
+ * would never be used.
  *
- * pino-pretty is a devDependency, and a production host installs with
- * `npm ci --omit=dev`, so the package is simply not on disk there. The
- * `require` therefore lives INSIDE this branch: a top-level import, or a
- * transport target named unconditionally in the options object, is resolved
- * while the logger is being CONSTRUCTED and so kills a production start-up
- * before the listener binds, naming a module nobody expected it to need. An
- * unconditional reference is fatal even where its value would never be used.
- *
- * This is the mistake the service's production-tree validation stage exists to
- * catch: it installs with `--omit=dev`, confirms pino-pretty is absent from the
- * tree, and then starts the service under PM2 with the environment set to
- * production. If the service reaches `online` and serves a request, this
- * branch is correct.
- *
- * WHY THE IN-PROCESS STREAM FORM RATHER THAN A WORKER-THREAD TRANSPORT, which
- * is the other way to attach pino-pretty. A worker transport is not drainable
- * on the way out, and that was measured on the pinned runtime: with
- * `transport: { target: 'pino-pretty' }` installed, `logger.flush(callback)`
- * was observed NOT to invoke its callback at all -- the process exited with the
- * callback still pending -- because the flush is queued behind a worker thread
- * that does not hold the event loop open. A callback-driven termination
- * sequence built on that either hangs until the supervisor kills the worker or
- * silently skips its own barrier, and both outcomes look correct in the source.
- * Building pino-pretty as an in-process stream over the synchronous sink above
- * keeps the whole write path inside this process and inside one turn of the
- * event loop: measured, the prettified bytes are on the descriptor before
- * `logger.info()` returns. That matches a production run that owns standard
- * output; the supervised production sink is the one case where a write is
- * queued instead and reported through its callback, and it never reaches this
- * branch.
- *
- * The options are kept minimal on purpose. `colorize` and `translateTime`
- * change presentation only; nothing here uses `ignore`, because the three
- * `base` identity fields are exactly what a reader needs to see, and hiding
- * them would make development output describe a different record from the one
- * production writes. `destination` is handed the sink INSTANCE rather than a
- * file descriptor deliberately: pino-pretty writes to an instance it is given
- * and would otherwise build its own, asynchronous by default, which would put
- * an undrainable buffer back into the very path this branch keeps synchronous.
+ * The in-process stream form is used rather than a worker-thread transport
+ * because a worker transport is not drainable on the way out: measured on the
+ * pinned runtime, `logger.flush(callback)` was never invoked at all behind
+ * `transport: { target: 'pino-pretty' }`, which would silently remove the
+ * barrier `src/server.js` builds its termination on. `destination` is handed
+ * the sink INSTANCE for the same reason -- pino-pretty would otherwise build
+ * its own, asynchronous by default.
  */
 if (!config.isProduction) {
   const pinoPretty = require('pino-pretty');
@@ -859,66 +1595,70 @@ if (!config.isProduction) {
    */
   prettyStream.flush = drainSink;
 
+  /*
+   * Recorded as the pipeline pino writes through, because it holds the sink
+   * INSTANCE: a fallback installed after a sink failure cannot be reached
+   * through it, which is what `failClosedIfRenderPipelineIsDead` acts on.
+   */
+  renderPipeline = prettyStream;
+
   target = prettyStream;
 }
 
 /**
  * The process-wide root logger.
  *
- * Every record it writes carries the three identity fields from `base` --
- * `pid`, `instance` and `service` -- alongside pino's own `level`, `time` and
- * `msg`. `req.headers.authorization` and `req.headers.cookie` are redacted
- * before anything is written, at the root, so every child inherits the policy,
- * and anything logged under `err` is reduced to the fields `sanitizeError`
- * permits -- type, message, stack, and a code or status where the error
- * carries one -- so no other property of an error can reach the stream.
- * In production the instance writes raw newline-delimited JSON, one complete
- * JSON object per line; outside production the same records are rendered as
- * human-readable text by pino-pretty.
+ * WHAT EVERY RECORD FROM IT CARRIES: the three identity fields from `base` --
+ * `pid`, `instance` and `service` -- alongside pino's own `level` (a number),
+ * `time` and `msg`.
  *
- * ALL LEVELS GO TO STDOUT, through the destination built above. No second
- * stream is configured and error-level records are deliberately NOT routed to
- * stderr: the PM2 descriptor sends stdout to `logs/out.log` and stderr to
- * `logs/error.log`, and `error.log` is expected to be empty in a clean run
- * precisely because pino writes every level to stdout. A service record
- * appearing there would mean this stream configuration had changed.
+ * WHAT IT WILL NOT WRITE: `req.headers.authorization` and `req.headers.cookie`,
+ * redacted at the root so every child inherits the policy; any property of a
+ * logged error outside `sanitizeError`'s allowlist -- type, message, stack, and
+ * a code or status where the error carries one; and, inside the strings it does
+ * write, credential material matching the patterns above `scrubSecrets`. Every
+ * such string is length-bounded, message and stack included.
  *
- * WHAT `logger.flush(callback)` GUARANTEES ON THIS INSTANCE, since
- * `src/server.js` builds its whole termination sequence on it: the callback
- * runs once every record written so far has reached the sink -- the
- * descriptor for the synchronous sonic-boom, and `logs/out.log` for a
- * supervised stream, whose own completion callback is what this waits on.
- * Neither case rests on timing: one is durable at write time and the other
- * reports completion explicitly. A future change that installs a destination
- * without a drain -- an asynchronous sonic-boom, or a worker-thread transport
- * -- breaks that guarantee silently, so it has to bring a drain the process
- * layer can await with it.
+ * WHERE THOSE RECORDS GO: one destination, every level, standard output for as
+ * long as it works. Error-level records are deliberately NOT routed to a second
+ * stream. In production the bytes are newline-delimited JSON, one complete
+ * object per line; outside production the same records are rendered as
+ * human-readable text by pino-pretty. If the destination fails, this module
+ * reports the failure on file descriptor 2, continues from a verified fallback
+ * where one exists, and exits non-zero where none does -- so a lost record is
+ * always reported somewhere.
+ *
+ * WHAT `logger.flush(callback)` REPORTS, since `src/server.js` builds its whole
+ * termination sequence on it: the callback runs once the sink has reported
+ * every record written so far complete -- immediately for the synchronous
+ * descriptor write, and on the stream's own completion callback for a
+ * supervised stream. It is handed the first failure the sink reported, or
+ * nothing at all if there was none, so "the records are out" and "records were
+ * lost" are distinguishable. Neither case rests on timing.
+ *
+ * WHAT HAPPENS TO THE BYTES AFTERWARDS IS THE DEPLOYMENT'S BUSINESS, NOT THIS
+ * MODULE'S CLAIM. Under the PM2 descriptor this service ships, standard output
+ * is expected to be collected into `logs/out.log` and standard error into
+ * `logs/error.log`, so `error.log` should stay empty in a clean run and a
+ * service record appearing there means either the stream configuration changed
+ * or the sink failed over. That is an assumption about the supervisor's
+ * configuration; what this module establishes is only that the sink reported
+ * the write complete.
+ *
+ * A future change that installs a destination without a drain -- an
+ * asynchronous sonic-boom, or a worker-thread transport -- removes the
+ * reporting above silently, so it has to bring a drain the process layer can
+ * await with it.
  *
  * @type {import('pino').Logger}
  */
 const logger = pino(options, target);
 
 /*
- * THE RAW INSTANCE IS EXPORTED -- NOT A FACADE, AND NOT `{ logger }`.
- *
- * Wrapping it in an object exposing only `info`, `warn` and `error` would drop
- * two members this service depends on, and both failures are silent ones.
- *
- * `logger.flush(callback)` is the middle step of the log -> flush -> release
- * the PM2 IPC channel -> exit sequence src/server.js runs on every exit path,
- * orderly drain and fatal alike, and it is meaningful here only because the
- * destination above was chosen to make it so. A destination that buffers
- * asynchronously turns the same call into a no-op barrier, and the final line
- * -- the one recording how the process ended -- disappears while the code that
- * wrote it still looks correct.
- *
- * `logger.child()` is what pino-http calls to derive the per-request logger on
- * `req.log`, so a facade would take the access record with it.
- *
- * Nothing else is exported, and nothing else should be added: no wrapper
- * around the `flush` that already exists, no named per-module loggers, and no
- * factory. There is exactly one root logger per process, and this is it. The
- * drain the process layer needs is provided by the destination, which is why
- * it is not a second export.
+ * The RAW instance -- not a facade and not `{ logger }` -- because two of its
+ * members are load-bearing: `flush(callback)` is the middle step of
+ * src/server.js's log -> flush -> release the PM2 IPC channel -> exit sequence,
+ * and `child()` is what pino-http calls to derive `req.log`. A facade would
+ * drop both, silently.
  */
 module.exports = logger;
